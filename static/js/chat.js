@@ -40,6 +40,7 @@ import { loadPanel } from './panels.js';
   const RESEARCH_TIMEOUT_MS = 360000;
   const DEFAULT_TIMEOUT_MS = 120000;
   const RUN_ID_ABORT_GRACE_MS = 2000; // timeout waits this long for a run-id header before hard-aborting
+  const WORKSPACE_AGENT_INTENT_RE = /\b(fix|debug|implement|change|update|refactor|patch|review|test|run|execute|start|launch|build|lint|typecheck|benchmark|eval|terminal[- ]bench|tbench|repo|repository|codebase|project|app|server|api|frontend|backend|bug|issue|pr|file|folder|directory|source|logs?|trace|stacktrace|traceback|docker|container|tmux|terminal|shell|git|branch|commit|diff|pytest|process|port|endpoint|computer|machine|laptop|device|system)\b/i;
   const RESEARCH_SVG = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>';
 
   let API_BASE = '';
@@ -1444,6 +1445,31 @@ import { loadPanel } from './panels.js';
       }
     }
 
+    // Feed the router the same coarse capability hints the eventual chat request will need.
+    // Unknown model capabilities remain eligible server-side; only known-incompatible entries drop out.
+    let _autoToggleState = {};
+    try { _autoToggleState = Storage.loadToggleState() || {}; } catch (_) { /* use chat-mode defaults */ }
+    const _autoResearch = !approvalForSend && !!(el('research-toggle') && el('research-toggle').checked);
+    const _autoPlanMode = !!_autoToggleState.plan_mode && !_autoResearch;
+    const _autoAgentMode = (_autoToggleState.mode || 'chat') === 'agent';
+    const _autoWorkspaceIntent = !isIncognitoForSend && WORKSPACE_AGENT_INTENT_RE.test(String(msg || ''));
+    let _autoDocumentOpen = false;
+    try { _autoDocumentOpen = !isIncognitoForSend && !!(documentModule && documentModule.getCurrentDocId && documentModule.getCurrentDocId()); } catch (_) {}
+    const _autoNeedsTools = !_autoResearch && (_autoAgentMode || _autoPlanMode || !!_pendingApprovedPlan || _autoWorkspaceIntent || _autoDocumentOpen);
+    let _pendingImageInfo = [];
+    try { if (!approvalForSend && fileHandlerModule.getPendingInfo) _pendingImageInfo = fileHandlerModule.getPendingInfo(); } catch (_) {}
+    const _regenImageIds = new Set(Array.from(document.querySelectorAll('.attach-image-preview[data-file-id]'), (node) => node.dataset.fileId));
+    const _autoHasImage = !approvalForSend && (
+      _pendingImageInfo.some((att) => (att.mime || '').startsWith('image/') || /\.(png|jpe?g|gif|webp|svg|bmp|heic|heif)$/i.test(att.name || ''))
+      || (_pendingRegenAttachments || []).some((id) => _regenImageIds.has(String(id)))
+    );
+
+    // Route only after the API-key confirmation and after a usable chat session exists;
+    // Auto must not forward a secret or a message that cannot be sent to the selected router.
+    if (window.odysseusAuto && await window.odysseusAuto.beforeSend(msg, selectedRouteForSend, !!approvalForSend, { hasImage: _autoHasImage, needsTools: _autoNeedsTools })) {
+      _releaseSendFlag();
+      return;
+    }
 
     const messageInput = el('message');
     const originalBtnText = submitBtn ? submitBtn.innerHTML : '';
@@ -1881,7 +1907,7 @@ import { loadPanel } from './panels.js';
 	      const isPlanMode = !!toggleState.plan_mode && !(el('research-toggle') && el('research-toggle').checked);
 	      let isAgentMode = (toggleState.mode || 'chat') === 'agent';
       const isIncognito = isIncognitoForSend;
-	      const workspaceAgentIntent = !isIncognito && /\b(fix|debug|implement|change|update|refactor|patch|review|test|run|execute|start|launch|build|lint|typecheck|benchmark|eval|terminal[- ]bench|tbench|repo|repository|codebase|project|app|server|api|frontend|backend|bug|issue|pr|file|folder|directory|source|logs?|trace|stacktrace|traceback|docker|container|tmux|terminal|shell|git|branch|commit|diff|pytest|process|port|endpoint|computer|machine|laptop|device|system)\b/i.test(String(msg || ''));
+	      const workspaceAgentIntent = !isIncognito && WORKSPACE_AGENT_INTENT_RE.test(String(msg || ''));
 	      if (isPlanMode || _pendingApprovedPlan) {
 	        isAgentMode = true;
 	      }

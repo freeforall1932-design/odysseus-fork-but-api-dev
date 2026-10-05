@@ -440,6 +440,9 @@ class TestClassifyEndpoint:
     def test_localhost(self):
         assert _classify_endpoint("http://localhost:1234") == "local"
 
+    def test_docker_host_gateway_is_local(self):
+        assert _classify_endpoint("http://host.docker.internal:11434/v1") == "local"
+
     def test_127(self):
         assert _classify_endpoint("http://127.0.0.1:8080/v1") == "local"
 
