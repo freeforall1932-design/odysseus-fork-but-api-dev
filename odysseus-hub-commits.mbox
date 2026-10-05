@@ -1,0 +1,3603 @@
+From 7b1cc846d479d28ad8e6b5e01dbb513d418ad77a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 5 Oct 2026 10:35:25 +0000
+Subject: [PATCH 1/2] feat(hub): provider presets, key-based model discovery,
+ Auto pool router and council runner
+
+Backend only. New code lives under src/hub/, routes/hub_*.py and tests/test_hub_*.py.
+Existing code is touched in one place: two lines in app.py that include routes/hub_routes.py.
+
+- POST /api/providers/models: pick a provider and paste a key, get its chat models
+  (OpenRouter incl. free flags and a key check, Gemini, OpenAI, Anthropic, Groq, Mistral,
+  DeepSeek, Together, Cerebras, NVIDIA, xAI, Hugging Face, Ollama, LM Studio, custom URL).
+  Discovery only: saving still goes through POST /api/model-endpoints.
+- /api/auto/pool and /api/auto/route: a saved model pool and a router model (cloud or
+  offline) that picks per message. Keep-local is a hard constraint.
+- /api/council/run (SSE): fanout, debate and verify modes, optional personas, anonymised and
+  shuffled cross-reading, and a chair that does not vote.
+- src/hub/README.md documents the design, the API and the known limits.
+---
+ app.py                             |   2 +
+ routes/hub_auto_routes.py          | 306 +++++++++++++++++++
+ routes/hub_provider_routes.py      |  92 ++++++
+ routes/hub_routes.py               |  13 +
+ src/hub/README.md                  |  58 ++++
+ src/hub/__init__.py                |   5 +
+ src/hub/auto_router.py             | 303 +++++++++++++++++++
+ src/hub/council.py                 | 335 +++++++++++++++++++++
+ src/hub/provider_presets.py        | 464 +++++++++++++++++++++++++++++
+ tests/test_hub_auto_router.py      | 254 ++++++++++++++++
+ tests/test_hub_council.py          | 287 ++++++++++++++++++
+ tests/test_hub_provider_presets.py | 278 +++++++++++++++++
+ tests/test_hub_routes.py           | 390 ++++++++++++++++++++++++
+ 13 files changed, 2787 insertions(+)
+ create mode 100644 routes/hub_auto_routes.py
+ create mode 100644 routes/hub_provider_routes.py
+ create mode 100644 routes/hub_routes.py
+ create mode 100644 src/hub/README.md
+ create mode 100644 src/hub/__init__.py
+ create mode 100644 src/hub/auto_router.py
+ create mode 100644 src/hub/council.py
+ create mode 100644 src/hub/provider_presets.py
+ create mode 100644 tests/test_hub_auto_router.py
+ create mode 100644 tests/test_hub_council.py
+ create mode 100644 tests/test_hub_provider_presets.py
+ create mode 100644 tests/test_hub_routes.py
+
+diff --git a/app.py b/app.py
+index 80eb83c8..224dc837 100644
+--- a/app.py
++++ b/app.py
+@@ -743,6 +743,8 @@ app.include_router(setup_embedding_routes())
+ # Models
+ from routes.model_routes import setup_model_routes
+ app.include_router(setup_model_routes(model_discovery))
++from routes.hub_routes import setup_hub_routes  # provider onboarding + Auto pool + council
++app.include_router(setup_hub_routes(skills_manager))
+ 
+ # GitHub Copilot device-flow login
+ from routes.copilot_routes import setup_copilot_routes
+diff --git a/routes/hub_auto_routes.py b/routes/hub_auto_routes.py
+new file mode 100644
+index 00000000..f9308bf4
+--- /dev/null
++++ b/routes/hub_auto_routes.py
+@@ -0,0 +1,306 @@
++# routes/hub_auto_routes.py
++"""Auto mode (a saved model pool + a router model) and the council runner.
++
++Storage: the pool and its settings live in the per-user preferences store the UI already uses, under
++``auto_pool`` and ``auto_settings``. These routes never create endpoints or keys; every model is
++resolved through the existing endpoint resolver, which enforces ownership and ``is_enabled``.
++
++Server-side truths the client cannot override:
++  * ``local`` is recomputed from the endpoint's address, never taken from the request.
++  * keep-local is HARD: it limits the router's candidates, skips a cloud router (so the message text is
++    never sent to a cloud model), and rejects a council that includes any cloud model.
++  * a refusal is surfaced, never hidden, and the prompt is never rewritten to get around it.
++"""
++import asyncio
++import json
++import logging
++import re
++from typing import Any, Dict, List, Optional
++
++from fastapi import APIRouter, HTTPException, Request
++from fastapi.responses import StreamingResponse
++from pydantic import BaseModel, Field
++
++from core.database import ModelEndpoint, SessionLocal
++from src.hub import auto_router as ar
++from src.hub import council as cn
++from src.auth_helpers import owner_filter, require_api_token_scope
++from src.endpoint_resolver import resolve_endpoint_by_id
++from src.llm_core import llm_call_async
++
++logger = logging.getLogger(__name__)
++
++POOL_KEY = "auto_pool"
++SETTINGS_KEY = "auto_settings"
++MAX_POOL = 60
++MAX_SKILL_CHARS = 6000
++DEFAULT_SETTINGS: Dict[str, Any] = {
++    "router_ref": "",          # "endpoint_id::model" that picks the model (cloud or offline); "" = no router
++    "default_ref": "",         # used when the router is unavailable or unreadable
++    "keep_local_default": False,
++    "refusal_fallback": False,  # reserved for the UI's "offer another model" button; never automatic
++}
++
++
++# --------------------------------------------------------------------------- request bodies
++class PoolBody(BaseModel):
++    pool: List[Dict[str, Any]] = Field(default_factory=list, max_length=MAX_POOL)
++    settings: Dict[str, Any] = Field(default_factory=dict)
++
++
++class RouteBody(BaseModel):
++    message: str = Field("", max_length=20000)
++    has_image: bool = False
++    needs_tools: bool = False
++    keep_local: Optional[bool] = None  # None -> the saved default
++    exclude: List[str] = Field(default_factory=list, max_length=MAX_POOL)  # refs already tried
++
++
++class PlanBody(BaseModel):
++    mode: str = "debate"
++    members: int = Field(4, ge=1, le=cn.MAX_MEMBERS)
++    rounds: int = Field(2, ge=1, le=cn.MAX_ROUNDS)
++
++
++class CouncilBody(BaseModel):
++    question: str = Field(..., min_length=1, max_length=20000)
++    mode: str = "debate"
++    members: List[Dict[str, Any]] = Field(..., min_length=1, max_length=cn.MAX_MEMBERS)
++    chair: str = Field(..., max_length=300)
++    rounds: int = Field(2, ge=1, le=cn.MAX_ROUNDS)
++    worker: str = Field("", max_length=300)
++    draft: str = Field("", max_length=20000)
++    skill: str = Field("", max_length=120)         # a skill NAME from the user's skill library
++    skill_scope: str = "chair"                      # chair | all
++    keep_local: Optional[bool] = None
++
++
++# --------------------------------------------------------------------------- helpers
++def _prefs():
++    from routes import prefs_routes  # lazy: keeps this module cheap to import in tests
++    return prefs_routes
++
++
++def _endpoint_index(owner: Optional[str]) -> Dict[str, Dict[str, Any]]:
++    """{endpoint_id: {name, local}} for the endpoints this user may use. ``local`` is server-truth."""
++    from routes.model_routes import _classify_endpoint  # lazy: heavy module
++    db = SessionLocal()
++    try:
++        q = db.query(ModelEndpoint).filter(ModelEndpoint.is_enabled == True)  # noqa: E712
++        if owner:
++            q = owner_filter(q, ModelEndpoint, owner)
++        out: Dict[str, Dict[str, Any]] = {}
++        for r in q.all():
++            kind = getattr(r, "endpoint_kind", None) or "auto"
++            out[r.id] = {"name": r.name or r.id, "local": _classify_endpoint(r.base_url or "", kind) == "local"}
++        return out
++    finally:
++        db.close()
++
++
++def _clean_entry(raw: Any) -> Optional[Dict[str, Any]]:
++    if not isinstance(raw, dict):
++        return None
++    ep = str(raw.get("endpoint_id") or "").strip()[:64]
++    model = str(raw.get("model") or "").strip()[:200]
++    if not ep or not model or "::" in ep:
++        return None
++    tags = raw.get("tags") or []
++    if isinstance(tags, str):
++        tags = tags.split(",")
++    clean_tags: List[str] = []
++    for t in list(tags)[:8]:
++        t = re.sub(r"[^a-z0-9 _+.\-]", "", str(t).strip().lower())[:24].strip()
++        if t and t not in clean_tags:
++            clean_tags.append(t)
++
++    def _b(v: Any) -> Optional[bool]:
++        return v if isinstance(v, bool) else None
++
++    ctx = raw.get("context_length")
++    ctx = int(ctx) if isinstance(ctx, (int, float)) and not isinstance(ctx, bool) and ctx > 0 else None
++    return {"endpoint_id": ep, "model": model, "label": str(raw.get("label") or "")[:80], "tags": clean_tags,
++            "free": _b(raw.get("free")), "context_length": ctx, "vision": _b(raw.get("vision")), "tools": _b(raw.get("tools"))}
++
++
++def _clean_ref(value: Any) -> str:
++    ref = str(value or "").strip()[:300]
++    ep, _, model = ref.partition("::")
++    return ref if ep and model else ""
++
++
++def _clean_settings(raw: Any) -> Dict[str, Any]:
++    raw = raw if isinstance(raw, dict) else {}
++    return {
++        "router_ref": _clean_ref(raw.get("router_ref")),
++        "default_ref": _clean_ref(raw.get("default_ref")),
++        "keep_local_default": bool(raw.get("keep_local_default", False)),
++        "refusal_fallback": bool(raw.get("refusal_fallback", False)),
++    }
++
++
++def _stored(owner: Optional[str]) -> tuple:
++    prefs = _prefs()._load_for_user(owner)
++    pool = [e for e in (_clean_entry(x) for x in (prefs.get(POOL_KEY) or [])[:MAX_POOL]) if e]
++    settings = {**DEFAULT_SETTINGS, **_clean_settings(prefs.get(SETTINGS_KEY))}
++    return pool, settings
++
++
++def _pool_entries(pool: List[Dict[str, Any]], index: Dict[str, Dict[str, Any]]) -> List[ar.PoolEntry]:
++    out: List[ar.PoolEntry] = []
++    for e in pool:
++        info = index.get(e["endpoint_id"])
++        if info is None:  # endpoint deleted or disabled
++            continue
++        out.append(ar.PoolEntry.from_dict({**e, "local": info["local"], "label": e.get("label") or e["model"]}))
++    return out
++
++
++def _make_call(owner: Optional[str], *, timeout: int = 90, retries: int = 2) -> cn.CallFn:
++    async def call(ref: str, messages: List[Dict[str, str]], temperature: float, max_tokens: int) -> str:
++        ep_id, model = ar.split_ref(ref)
++        resolved = resolve_endpoint_by_id(ep_id, model, owner=owner, require_exact_model=True)
++        if not resolved:
++            raise RuntimeError("model unavailable")
++        url, m, headers = resolved
++        return await llm_call_async(
++            url, m, messages, temperature=temperature, max_tokens=max_tokens, headers=headers,
++            timeout=timeout, max_retries=retries, workload="foreground",
++        )
++    return call
++
++
++def _sse(obj: Any) -> str:
++    return f"data: {json.dumps(obj)}\n\n"
++
++
++def setup_auto_routes(skills_manager=None) -> APIRouter:
++    router = APIRouter(prefix="/api", tags=["auto", "council"])
++
++    # ---- pool ------------------------------------------------------------------------------
++    @router.get("/auto/pool")
++    def get_pool(request: Request):
++        owner = require_api_token_scope(request, "chat")
++        pool, settings = _stored(owner)
++        index = _endpoint_index(owner)
++        shown = []
++        for e in pool:
++            info = index.get(e["endpoint_id"])
++            shown.append({**e, "available": info is not None, "local": bool(info and info["local"]),
++                          "endpoint_name": (info or {}).get("name", "")})
++        return {"pool": shown, "settings": settings, "max_pool": MAX_POOL,
++                "endpoints": [{"id": k, **v} for k, v in index.items()]}
++
++    @router.put("/auto/pool")
++    def put_pool(request: Request, body: PoolBody):
++        owner = require_api_token_scope(request, "chat")
++        index = _endpoint_index(owner)
++        seen, clean, dropped = set(), [], 0
++        for raw in body.pool:
++            e = _clean_entry(raw)
++            key = (e["endpoint_id"], e["model"]) if e else None
++            if not e or e["endpoint_id"] not in index or key in seen:
++                dropped += 1
++                continue
++            seen.add(key)
++            clean.append(e)
++        settings = {**DEFAULT_SETTINGS, **_clean_settings(body.settings)}
++        for k in ("router_ref", "default_ref"):  # refs must point at an endpoint this user can use
++            ep, _, _m = settings[k].partition("::")
++            if settings[k] and ep not in index:
++                settings[k] = ""
++        prefs = _prefs()
++        stored = prefs._load_for_user(owner)
++        stored[POOL_KEY] = clean
++        stored[SETTINGS_KEY] = settings
++        prefs._save_for_user(owner, stored)
++        return {"saved": len(clean), "dropped": dropped, "settings": settings}
++
++    # ---- routing ---------------------------------------------------------------------------
++    @router.post("/auto/route")
++    async def route_message(request: Request, body: RouteBody):
++        owner = require_api_token_scope(request, "chat")
++        pool, settings = _stored(owner)
++        index = _endpoint_index(owner)
++        entries = _pool_entries(pool, index)
++        keep_local = settings["keep_local_default"] if body.keep_local is None else body.keep_local
++        task = ar.TaskInfo(body.message, has_image=body.has_image, needs_tools=body.needs_tools, keep_local=keep_local)
++
++        router_call = None
++        notes: List[str] = []
++        rref = settings["router_ref"]
++        if rref:
++            r_ep, _, _r_model = rref.partition("::")
++            r_info = index.get(r_ep)
++            if r_info is None:
++                notes.append("router model unavailable")
++            elif keep_local and not r_info["local"]:
++                # The router would see the message text. Under keep-local that must stay on this machine.
++                notes.append("router skipped (it is a cloud model and keep-local is on)")
++            else:
++                _call = _make_call(owner, timeout=15, retries=1)
++
++                async def router_call(messages, _c=_call, _ref=rref):
++                    return await _c(_ref, messages, 0.0, 120)
++        try:
++            d = await ar.route(task, entries, router_call, default_ref=settings["default_ref"], exclude=body.exclude)
++        except ar.NoRouteError as e:
++            raise HTTPException(409, str(e))
++        return {
++            "endpoint_id": d.entry.endpoint_id, "model": d.entry.model, "label": d.entry.label or d.entry.model,
++            "local": d.entry.local, "reason": d.reason, "source": d.source, "notes": notes + d.notes,
++            "candidates": [c.ref for c in d.candidates],
++        }
++
++    # ---- council ---------------------------------------------------------------------------
++    @router.post("/council/plan")
++    def council_plan(request: Request, body: PlanBody):
++        require_api_token_scope(request, "chat")
++        if body.mode not in cn.MODES:
++            raise HTTPException(400, f"mode must be one of {', '.join(cn.MODES)}")
++        return cn.plan(body.mode, body.members, body.rounds)
++
++    @router.post("/council/run")
++    async def council_run(request: Request, body: CouncilBody):
++        owner = require_api_token_scope(request, "chat")
++        skill_text = ""
++        if body.skill:
++            raw = skills_manager.read_skill_md(body.skill, owner=owner) if skills_manager else None
++            if raw is None:
++                raise HTTPException(404, f"Skill '{body.skill}' was not found.")
++            from services.memory.skill_format import parse_frontmatter
++            _meta, skill_text = parse_frontmatter(raw)
++            skill_text = skill_text.strip()[:MAX_SKILL_CHARS]
++        try:
++            cfg = cn.config_from_dict(body.model_dump(exclude={"question", "skill", "keep_local"}), skill_text)
++        except ValueError as e:
++            raise HTTPException(400, str(e))
++
++        index = _endpoint_index(owner)
++        _pool, settings = _stored(owner)
++        keep_local = settings["keep_local_default"] if body.keep_local is None else body.keep_local
++        refs = [m.ref for m in cfg.members] + [cfg.chair] + ([cfg.worker] if cfg.worker else [])
++        for ref in refs:
++            ep_id, model = ar.split_ref(ref)
++            if ep_id not in index or not model:
++                raise HTTPException(400, f"Model not available: {model or ref}")
++            if keep_local and not index[ep_id]["local"]:
++                raise HTTPException(409, f"Keep-local is on, but {model} is a cloud model. Use offline models only, or turn keep-local off.")
++
++        call = _make_call(owner)
++
++        async def stream():
++            try:
++                async for ev in cn.run_council(body.question, cfg, call):
++                    yield _sse(ev)
++            except asyncio.CancelledError:
++                raise
++            except Exception:
++                logger.exception("council run failed")
++                yield _sse({"type": "error", "message": "The council failed unexpectedly."})
++            yield "data: [DONE]\n\n"
++
++        return StreamingResponse(stream(), media_type="text/event-stream",
++                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
++
++    return router
+diff --git a/routes/hub_provider_routes.py b/routes/hub_provider_routes.py
+new file mode 100644
+index 00000000..3aa7eeb0
+--- /dev/null
++++ b/routes/hub_provider_routes.py
+@@ -0,0 +1,92 @@
++# routes/hub_provider_routes.py
++"""Provider onboarding: pick a provider, paste a key, see its models.
++
++These routes only *discover*. Saving is done by the existing ``POST /api/model-endpoints`` (which
++encrypts the key and supports pinned models), so nothing about key storage changes.
++
++Admin-only, like adding an endpoint. A cloud preset always talks to its own fixed address: a caller
++can override the base URL only for local/custom providers, so a pasted key is never sent to a URL
++someone typed for a cloud provider.
++"""
++import logging
++from dataclasses import asdict
++
++from fastapi import APIRouter, HTTPException, Request
++from pydantic import BaseModel, Field
++
++from core.middleware import require_admin
++from src.hub import provider_presets as pp
++
++logger = logging.getLogger(__name__)
++
++
++class GuessBody(BaseModel):
++    api_key: str = Field("", max_length=512)
++
++
++class ModelsBody(BaseModel):
++    provider: str = Field(..., max_length=40)
++    api_key: str = Field("", max_length=512)
++    base_url: str = Field("", max_length=300)
++
++
++def _http_status(err: "pp.DiscoveryError") -> int:
++    # Never relay an upstream 401/403: the browser would read it as "your Odysseus session expired".
++    if err.status in (401, 403, 404):
++        return 400
++    if err.status == 429:
++        return 429
++    if err.status is None and not err.message.startswith(("Paste", "Unknown", "A base URL", "The base URL")):
++        return 502
++    return 400
++
++
++def setup_provider_routes() -> APIRouter:
++    router = APIRouter(prefix="/api/providers", tags=["providers"])
++
++    @router.get("/presets")
++    def list_presets(request: Request):
++        require_admin(request)
++        return {"presets": pp.public_presets()}
++
++    @router.post("/guess")
++    def guess_provider(request: Request, body: GuessBody):
++        require_admin(request)
++        return {"candidates": pp.guess_provider(body.api_key)}
++
++    @router.post("/models")
++    async def provider_models(request: Request, body: ModelsBody):
++        require_admin(request)
++        preset = pp.get_preset(body.provider)
++        if preset is None:
++            raise HTTPException(400, "Unknown provider.")
++        override = body.base_url.strip()
++        if override and not (preset.local or preset.id == "custom"):
++            raise HTTPException(400, "The address of a cloud provider is fixed; pick 'Other (OpenAI-compatible URL)' for a custom one.")
++        base = override or preset.base_url
++        if preset.local and base:
++            # Inside Docker, "localhost" is the container; reuse the app's own rewrite so Ollama / LM Studio
++            # on the host machine are reachable exactly as they are when added the manual way.
++            try:
++                from routes.model_routes import _rewrite_loopback_for_docker
++                base = _rewrite_loopback_for_docker(base)
++            except Exception:  # pragma: no cover - best effort only
++                logger.debug("loopback rewrite unavailable", exc_info=True)
++        try:
++            from src.tls_overrides import llm_verify
++            found = await pp.discover(preset.id, body.api_key, base, verify=llm_verify())
++        except pp.DiscoveryError as e:
++            raise HTTPException(_http_status(e), e.message)
++        cards = [asdict(c) for c in found.cards]
++        return {
++            "provider": preset.id,
++            "label": preset.label,
++            "base_url": base,
++            "local": preset.local,
++            "key_info": found.key_info,
++            "count": len(cards),
++            "free_count": sum(1 for c in cards if c.get("free")),
++            "models": cards,
++        }
++
++    return router
+diff --git a/routes/hub_routes.py b/routes/hub_routes.py
+new file mode 100644
+index 00000000..35201c29
+--- /dev/null
++++ b/routes/hub_routes.py
+@@ -0,0 +1,13 @@
++# routes/hub_routes.py
++"""One include for the whole feature: provider onboarding + Auto pool + council."""
++from fastapi import APIRouter
++
++from routes.hub_auto_routes import setup_auto_routes
++from routes.hub_provider_routes import setup_provider_routes
++
++
++def setup_hub_routes(skills_manager=None) -> APIRouter:
++    router = APIRouter()
++    router.include_router(setup_provider_routes())
++    router.include_router(setup_auto_routes(skills_manager))
++    return router
+diff --git a/src/hub/README.md b/src/hub/README.md
+new file mode 100644
+index 00000000..106c1c51
+--- /dev/null
++++ b/src/hub/README.md
+@@ -0,0 +1,58 @@
++# Providers, Auto pool and Council
++
++Adds three things on top of the existing endpoint / chat / skills code. Nothing existing was replaced.
++
++| Piece | Files |
++|---|---|
++| Provider onboarding (pick provider, paste key, models are fetched) | `src/hub/provider_presets.py`, `routes/hub_provider_routes.py` |
++| Auto mode (saved pool + router model, keep-local) | `src/hub/auto_router.py`, `routes/hub_auto_routes.py` |
++| Council (fan-out, debate, verify) | `src/hub/council.py`, `routes/hub_auto_routes.py` |
++| UI (one modal, three tabs) | `static/js/hub/hub.js` (+ 3 lines in `chat.js`, 1 tag in `index.html`, 2 lines in `app.py` via `routes/hub_routes.py`) |
++
++Open it from the model picker: **API key** button (Connect), **Pool** and **Council** buttons, **Auto** and **Keep local** switches.
++
++## Connect
++`POST /api/providers/models {provider, api_key}` lists the chat models a key can use. It never saves anything.
++Saving goes through the existing `POST /api/model-endpoints` with the ticked models as `pinned_models`, so key
++encryption, the picker and Docker loopback handling behave exactly as when an endpoint is added by hand.
++
++Presets: OpenRouter (free models detected from pricing; key checked with `GET /key` first), Google Gemini, OpenAI,
++Anthropic, Groq, Mistral, DeepSeek, Together, Cerebras, NVIDIA NIM, xAI, Hugging Face, Ollama, LM Studio, and a custom
++OpenAI-compatible URL. A cloud preset always talks to its own fixed address; only local/custom may override it.
++
++## Auto
++`PUT /api/auto/pool` stores the pool (max 60) and settings in the existing per-user prefs store.
++`POST /api/auto/route {message, keep_local?, exclude?}` returns `{endpoint_id, model, reason, source}`.
++The router model sees a numbered list of the pool and answers `{"pick": n}`. If it is slow, down, or unreadable,
++the default model is used. The chat itself still goes through the normal `chat_stream`, so streaming, history and
++skills are untouched, and picking a different model on any turn already worked (the selected model is sent per message).
++
++**Keep-local is hard.** Candidates are limited to offline models; a cloud router is skipped, so the message text is never
++sent to it; with no offline model in the pool the request fails (HTTP 409 / the send is blocked) rather than falling
++through to a cloud model. Whether a model is "local" is recomputed server-side from the endpoint address.
++
++## Council
++`POST /api/council/run` streams events (`start, draft, member, round_done, chair, done`).
++Modes: `fanout` (independent answers, chair merges), `debate` (members read the others, anonymised and shuffled, and
++revise), `verify` (a worker, typically an offline model, drafts; the others review it; the chair issues
++"accepted as-is" or "corrected"). Personas are optional (`researcher, logician, contrarian, builder` or custom).
++Members never vote on each other, the chair is a separate seat, and a failed or declining member is reported, not hidden.
++A skill (by name, from your skill library) is injected into the chair by default, or into every member with `skill_scope: all`.
++`POST /api/council/plan` returns a rough call/token estimate; debate costs far more tokens than its call count suggests
++because each later-round prompt carries everyone's answer.
++
++## What this deliberately does not do
++* It never rewrites a prompt to get past a refusal, and never retries a refusal on another model by itself.
++  `src/hub/auto_router.answer_with_fallback(on_refusal=True)` exists for non-streaming callers, is off by default and unused.
++* A refusal is shown as a refusal. In a council it counts as "declined" and the chair is told.
++
++## Known limits
++* Council and router calls are non-streaming; the council UI shows each member as it finishes.
++* "Local" is the app's existing endpoint classifier: an endpoint you marked local, or one on a loopback, private-LAN or
++  Tailscale address. A server on another machine of yours therefore counts as local even though it is not this computer.
++* Refusal detection on text is a heuristic (short replies that open with a refusal phrase). Provider signals
++  (`content_filter`, `stop_reason: refusal`) are honoured when a caller passes them.
++* Verification catches what the reviewing models know. It does not check citations; check references yourself.
++
++## Tests
++`tests/test_hub_provider_presets.py`, `test_hub_auto_router.py`, `test_hub_council.py`, `test_hub_routes.py` (no network).
+diff --git a/src/hub/__init__.py b/src/hub/__init__.py
+new file mode 100644
+index 00000000..020338a1
+--- /dev/null
++++ b/src/hub/__init__.py
+@@ -0,0 +1,5 @@
++"""Providers (paste a key, fetch models), Auto pool routing and the council runner.
++
++Everything for the feature lives under src/hub, routes/hub_*.py, static/js/hub and tests/test_hub_*.py,
++so it can be dropped or moved without touching upstream paths. See src/hub/README.md.
++"""
+diff --git a/src/hub/auto_router.py b/src/hub/auto_router.py
+new file mode 100644
+index 00000000..25925c47
+--- /dev/null
++++ b/src/hub/auto_router.py
+@@ -0,0 +1,303 @@
++"""Auto mode: pick the right model from a saved pool, per message.
++
++Pieces (all pure / injectable so they can be tested without a network):
++
++* ``PoolEntry``      - one saved model (endpoint id + model id + tags + local/cloud).
++* ``prefilter``      - cheap rules before any LLM is asked (vision, tools, context, keep-local).
++* ``route``          - asks a small *router model* (cloud or offline) to choose; falls back
++                       to the user's order if the router is slow or answers badly.
++* refusal helpers    - ``looks_like_refusal`` and ``answer_with_fallback`` for non-streaming
++                       paths (council, verification). Every attempt is reported back so the
++                       UI can show which model answered and which ones declined.
++
++Design rules worth keeping:
++
++* ``keep_local`` is a HARD constraint. If nothing local is in the pool the request fails; it
++  never silently falls through to a cloud model.
++* The router only ever chooses from the pool the user saved. It cannot add models.
++* A refusal is reported, never hidden, and the prompt is never rewritten to get around it.
++"""
++from __future__ import annotations
++
++import asyncio
++import json
++import re
++from dataclasses import dataclass, field
++from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
++
++AUTO_MODEL_ID = "auto"
++
++# ``call(messages) -> text``. Supplied by the caller so this module knows nothing about HTTP.
++RouterCall = Callable[[List[Dict[str, str]]], Awaitable[str]]
++# ``call(entry, messages) -> text`` for answering with a specific pool entry.
++EntryCall = Callable[["PoolEntry", List[Dict[str, str]]], Awaitable[str]]
++
++
++class NoRouteError(Exception):
++    """Raised when a hard constraint (keep_local) cannot be satisfied."""
++
++
++@dataclass(frozen=True)
++class PoolEntry:
++    endpoint_id: str
++    model: str
++    label: str = ""
++    tags: Tuple[str, ...] = ()
++    local: bool = False
++    free: Optional[bool] = None
++    context_length: Optional[int] = None
++    vision: Optional[bool] = None
++    tools: Optional[bool] = None
++
++    @property
++    def ref(self) -> str:
++        return f"{self.endpoint_id}::{self.model}"
++
++    @classmethod
++    def from_dict(cls, d: Dict[str, Any]) -> "PoolEntry":
++        tags = d.get("tags") or ()
++        if isinstance(tags, str):
++            tags = [t.strip() for t in tags.split(",")]
++        return cls(
++            endpoint_id=str(d.get("endpoint_id") or ""),
++            model=str(d.get("model") or ""),
++            label=str(d.get("label") or ""),
++            tags=tuple(t for t in (str(x).strip().lower() for x in tags) if t),
++            local=bool(d.get("local")),
++            free=d.get("free"),
++            context_length=d.get("context_length"),
++            vision=d.get("vision"),
++            tools=d.get("tools"),
++        )
++
++    def describe(self) -> str:
++        bits = ["offline" if self.local else "cloud"]
++        if self.free:
++            bits.append("free")
++        if self.context_length:
++            bits.append(f"{self.context_length // 1000}k ctx" if self.context_length >= 1000 else f"{self.context_length} ctx")
++        if self.vision:
++            bits.append("vision")
++        if self.tags:
++            bits.append("tags: " + ", ".join(self.tags))
++        return f"{self.label or self.model} [{'; '.join(bits)}]"
++
++
++def split_ref(ref: str) -> Tuple[str, str]:
++    """'endpoint_id::model' -> (endpoint_id, model). Model ids may themselves contain colons."""
++    ep, _, model = (ref or "").partition("::")
++    return ep, model
++
++
++@dataclass
++class TaskInfo:
++    text: str
++    has_image: bool = False
++    needs_tools: bool = False
++    keep_local: bool = False
++    est_tokens: int = 0
++
++    def __post_init__(self):
++        if not self.est_tokens:
++            self.est_tokens = max(1, len(self.text or "") // 4)
++
++
++@dataclass
++class RouteDecision:
++    entry: PoolEntry
++    reason: str
++    source: str  # router | only-candidate | fallback
++    notes: List[str] = field(default_factory=list)
++    candidates: List[PoolEntry] = field(default_factory=list)
++
++
++# --------------------------------------------------------------------------- prefilter
++def prefilter(
++    task: TaskInfo, pool: Sequence[PoolEntry], exclude: Sequence[str] = ()
++) -> Tuple[List[PoolEntry], List[str]]:
++    """Narrow the pool with cheap rules. keep_local and exclude are hard; the rest are best-effort."""
++    notes: List[str] = []
++    cands = [e for e in pool if e.endpoint_id and e.model]
++    if exclude:
++        skip = set(exclude)
++        left = [e for e in cands if e.ref not in skip]
++        if len(left) != len(cands):
++            notes.append(f"skipped {len(cands) - len(left)} already tried")
++        if not left:
++            raise NoRouteError("No other model left to try in the pool.")
++        cands = left
++    if task.keep_local:
++        cands = [e for e in cands if e.local]
++        if not cands:
++            raise NoRouteError("Keep-local is on, but the pool has no offline model. Add one or turn keep-local off.")
++        notes.append("keep-local")
++
++    def soft(pred: Callable[[PoolEntry], bool], why: str) -> None:
++        nonlocal cands
++        kept = [e for e in cands if pred(e)]
++        if kept and len(kept) != len(cands):
++            cands = kept
++            notes.append(why)
++        elif not kept:
++            notes.append(f"{why} (no model matched, ignored)")
++
++    if task.has_image:
++        soft(lambda e: e.vision is not False, "vision")
++    if task.needs_tools:
++        soft(lambda e: e.tools is not False, "tools")
++    need = int(task.est_tokens * 1.5) + 1000
++    soft(lambda e: not e.context_length or e.context_length >= need, "context-length")
++    return cands, notes
++
++
++# --------------------------------------------------------------------------- router prompt
++ROUTER_SYSTEM = (
++    "You are a model router. Pick the single best model for the user's task from the numbered list. "
++    "Prefer the cheapest or fastest model that can do the task well; choose a stronger model only for "
++    "hard reasoning, long context, careful writing or code. "
++    'Reply with ONLY JSON like {"pick": 2, "reason": "short code task"} - reason at most 12 words.'
++)
++
++
++def build_router_messages(task: TaskInfo, cands: Sequence[PoolEntry], max_chars: int = 1200) -> List[Dict[str, str]]:
++    lines = [f"{i}. {e.describe()}" for i, e in enumerate(cands, 1)]
++    text = (task.text or "").strip()
++    if len(text) > max_chars:
++        text = text[: max_chars // 2] + "\n...\n" + text[-max_chars // 2:]
++    flags = []
++    if task.has_image:
++        flags.append("has an image")
++    if task.needs_tools:
++        flags.append("needs tools")
++    user = "Models:\n" + "\n".join(lines) + ("\n\nTask flags: " + ", ".join(flags) if flags else "") + "\n\nTask:\n" + text
++    return [{"role": "system", "content": ROUTER_SYSTEM}, {"role": "user", "content": user}]
++
++
++_JSON_OBJ = re.compile(r"\{.*?\}", re.S)
++
++
++def parse_pick(text: str, n: int) -> Tuple[Optional[int], str]:
++    """Return (1-based index or None, reason). Tolerant of fences, prose and bare numbers."""
++    body = (text or "").strip()
++    for m in _JSON_OBJ.finditer(body):
++        try:
++            obj = json.loads(m.group(0))
++        except ValueError:
++            continue
++        if isinstance(obj, dict) and "pick" in obj:
++            try:
++                idx = int(obj["pick"])
++            except (TypeError, ValueError):
++                continue
++            if 1 <= idx <= n:
++                return idx, str(obj.get("reason") or "")[:120]
++    m = re.search(r'"?pick"?\s*[:=]\s*(\d+)', body)
++    if m and 1 <= int(m.group(1)) <= n:
++        return int(m.group(1)), ""
++    if re.fullmatch(r"\s*\d+\s*", body) and 1 <= int(body) <= n:
++        return int(body), ""
++    return None, ""
++
++
++async def route(
++    task: TaskInfo,
++    pool: Sequence[PoolEntry],
++    router_call: Optional[RouterCall],
++    *,
++    default_ref: str = "",
++    exclude: Sequence[str] = (),
++    max_candidates: int = 12,
++    timeout: float = 15.0,
++) -> RouteDecision:
++    """Choose a pool entry. Raises NoRouteError only for a hard constraint (keep-local, nothing left to try, empty pool)."""
++    cands, notes = prefilter(task, pool, exclude)
++    if not cands:
++        raise NoRouteError("The auto pool is empty. Add models to the pool first.")
++    cands = cands[:max_candidates]
++    default = next((e for e in cands if e.ref == default_ref), cands[0])
++    if len(cands) == 1:
++        return RouteDecision(cands[0], "only one eligible model", "only-candidate", notes, cands)
++    if router_call is None:
++        return RouteDecision(default, "no router model configured; using pool order", "fallback", notes, cands)
++    try:
++        reply = await asyncio.wait_for(router_call(build_router_messages(task, cands)), timeout=timeout)
++    except Exception as exc:  # router down / slow / rate-limited: degrade, do not fail the chat
++        notes.append(f"router unavailable ({type(exc).__name__})")
++        return RouteDecision(default, "router unavailable; using pool order", "fallback", notes, cands)
++    idx, why = parse_pick(reply, len(cands))
++    if idx is None:
++        notes.append("router reply unreadable")
++        return RouteDecision(default, "router reply unreadable; using pool order", "fallback", notes, cands)
++    return RouteDecision(cands[idx - 1], why or "router pick", "router", notes, cands)
++
++
++# --------------------------------------------------------------------------- refusals
++# Text heuristics only fire on SHORT replies that OPEN with a refusal; long answers that merely
++# contain "I can't" somewhere are left alone. They will still miss some refusals and flag some
++# non-refusals, which is why callers surface every attempt instead of acting silently.
++_REFUSAL_OPENERS = [
++    r"i\s*(?:'m|am)\s+sorry,?\s+(?:but\s+)?i\s+(?:can(?:no|')t|won'?t|am\s+(?:unable|not\s+able))",
++    r"i\s+(?:can(?:no|')t|cannot|won'?t|will\s+not)\s+(?:help|assist|provide|comply|fulfil+|support|continue|do\s+that)",
++    r"i(?:'m|\s+am)\s+(?:unable|not\s+able)\s+to\s+(?:help|assist|provide|comply|fulfil+)",
++    r"(?:sorry,?\s+)?i\s+must\s+(?:decline|refuse)",
++    r"as\s+an\s+ai(?:\s+language\s+model)?,?\s+i\s+(?:can(?:no|')t|cannot|am\s+unable)",
++]
++_REFUSAL_RE = re.compile(r"^\s*(?:" + "|".join(_REFUSAL_OPENERS) + r")", re.I)
++_REFUSAL_MAX_CHARS = 700
++
++
++def looks_like_refusal(text: str, *, finish_reason: str = "", stop_reason: str = "") -> bool:
++    if (finish_reason or "").lower() == "content_filter" or (stop_reason or "").lower() == "refusal":
++        return True
++    body = (text or "").strip()
++    return bool(body) and len(body) <= _REFUSAL_MAX_CHARS and bool(_REFUSAL_RE.match(body))
++
++
++@dataclass
++class Attempt:
++    entry: PoolEntry
++    outcome: str  # ok | error | refused
++    detail: str = ""
++
++
++@dataclass
++class FallbackResult:
++    text: str
++    entry: Optional[PoolEntry]
++    attempts: List[Attempt]
++    all_declined: bool = False
++
++
++async def answer_with_fallback(
++    entries: Sequence[PoolEntry],
++    call: EntryCall,
++    messages: List[Dict[str, str]],
++    *,
++    on_refusal: bool = False,
++    on_error: bool = True,
++) -> FallbackResult:
++    """Try entries in order. Moves on after an error and, if enabled, after a refusal.
++
++    The same ``messages`` go to every model unchanged. If every model declined, the first
++    refusal text is returned with ``all_declined=True`` so the user sees what happened.
++    """
++    attempts: List[Attempt] = []
++    first_refusal: Optional[Tuple[PoolEntry, str]] = None
++    for entry in entries:
++        try:
++            text = await call(entry, messages)
++        except Exception as exc:
++            attempts.append(Attempt(entry, "error", type(exc).__name__))
++            if on_error:
++                continue
++            raise
++        if on_refusal and looks_like_refusal(text):
++            attempts.append(Attempt(entry, "refused", "declined"))
++            if first_refusal is None:
++                first_refusal = (entry, text)
++            continue
++        attempts.append(Attempt(entry, "ok"))
++        return FallbackResult(text, entry, attempts)
++    if first_refusal is not None:
++        return FallbackResult(first_refusal[1], first_refusal[0], attempts, all_declined=True)
++    return FallbackResult("", None, attempts, all_declined=False)
+diff --git a/src/hub/council.py b/src/hub/council.py
+new file mode 100644
+index 00000000..cbb49fbc
+--- /dev/null
++++ b/src/hub/council.py
+@@ -0,0 +1,335 @@
++"""Council: several models (or several personas of one model) work a question, a chair merges.
++
++How a single model can "talk to itself": it can't. Each member is a separate call, and the
++orchestrator (this file) pastes one member's answer into another member's next prompt. A
++persona is just the system prompt, so diversity comes from (a) different prompts, (b) different
++models when you have API keys for several, and (c) sampling temperature.
++
++Modes
++-----
++fanout  members answer independently, in parallel; the chair merges.
++debate  fanout, then every member reads the others (anonymised, shuffled) and revises; chair merges.
++verify  a *worker* (typically a small offline model) drafts; members review the draft blind to
++        who wrote it; the chair corrects it and says whether it was accepted as-is.
++
++Guard-rails against the failure PewDiePie's council hit (members voting to protect each other):
++members never score each other, the chair is a separate seat that does not vote, others' answers
++are anonymised and shuffled per reader, and the chair is told to weigh arguments, not counts.
++"""
++from __future__ import annotations
++
++import asyncio
++import random
++from dataclasses import dataclass, field
++from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional
++
++from src.hub.auto_router import looks_like_refusal
++
++# call(ref, messages, temperature, max_tokens) -> text.  ``ref`` is "endpoint_id::model".
++CallFn = Callable[[str, List[Dict[str, str]], float, int], Awaitable[str]]
++
++MODES = ("fanout", "debate", "verify")
++MAX_MEMBERS = 8
++MAX_ROUNDS = 3
++
++
++@dataclass(frozen=True)
++class Persona:
++    name: str
++    prompt: str
++
++
++DEFAULT_PERSONAS = (
++    Persona("Researcher", "You are the Researcher. Ground every claim in facts and say what you would need to verify."),
++    Persona("Logician", "You are the Logician. Check numbers, steps and logic. Flag anything that does not follow."),
++    Persona("Contrarian", "You are the Contrarian. Challenge the obvious answer and name what everyone is missing."),
++    Persona("Builder", "You are the Builder. Turn the problem into concrete steps someone can do today."),
++)
++
++NEUTRAL = "You are one member of a council. Answer carefully and concisely. State your confidence and what you could not verify."
++CHAIR_SYSTEM = (
++    "You are the chair of a council. You receive the question and each member's answer. Judge by the quality of "
++    "the reasoning, not by how many members agree. Keep what holds up, flag what stays uncertain or disputed, and "
++    "write ONE final answer for the user. If some members could not answer, add one short line saying so."
++)
++REVIEW_SYSTEM = (
++    "You are reviewing a draft answer written by another model. Do not rewrite it. List (1) factual errors or "
++    "claims you cannot support, (2) missing steps or caveats, (3) anything risky. If it is fine, say so. "
++    "End with a line 'SCORE: n/5'."
++)
++VERIFY_CHAIR_SYSTEM = (
++    "You are the chair. You receive the question, a draft answer and reviews of it. Produce the final answer: fix "
++    "what the reviews establish, keep what is fine, and do not add claims nobody verified. Start with one line, "
++    "either 'Verdict: accepted as-is' or 'Verdict: corrected', then give the final answer."
++)
++
++
++@dataclass
++class Member:
++    ref: str
++    persona: Optional[Persona] = None
++    label: str = ""
++    temperature: float = 0.8
++
++    @property
++    def display(self) -> str:
++        return self.label or (self.persona.name if self.persona else self.ref.partition("::")[2] or self.ref)
++
++
++@dataclass
++class CouncilConfig:
++    members: List[Member]
++    chair: str
++    mode: str = "debate"
++    rounds: int = 2
++    skill_text: str = ""
++    skill_scope: str = "chair"  # chair | all
++    worker: str = ""            # verify: who drafts (ignored when ``draft`` is given)
++    draft: str = ""             # verify: an existing answer to review
++    member_max_tokens: int = 600
++    chair_max_tokens: int = 900
++    seed: Optional[int] = None  # makes the shuffle deterministic (tests)
++
++
++@dataclass
++class _Result:
++    text: str = ""
++    ok: bool = False
++    refused: bool = False
++    error: str = ""
++
++
++def plan(mode: str, n: int = 4, rounds: int = 2, q: int = 400, a: int = 300, persona: int = 60, chair_out: int = 400) -> Dict[str, Any]:
++    """Rough budget. q/a/persona/chair_out are token GUESSES, so treat the result as an order of magnitude."""
++    first = n * (persona + q + a)
++    later = (rounds - 1) * n * (persona + q + a + (n - 1) * a + 60 + a) if mode == "debate" else 0
++    chair = 150 + q + n * a + chair_out
++    if mode == "verify":
++        first = (q + a) + n * (persona + q + a + a)  # worker draft + n reviews of it
++    calls = (1 if mode == "verify" else 0) + n * (rounds if mode == "debate" else 1) + 1
++    total = first + later + chair
++    return {"mode": mode, "calls": calls, "tokens": total, "x_single_call": round(total / (q + a), 1)}
++
++
++# --------------------------------------------------------------------------- prompts
++def _system_for(cfg: CouncilConfig, m: Member, base: Optional[str] = None) -> str:
++    parts = [m.persona.prompt if m.persona else (base or NEUTRAL)]
++    if cfg.skill_text and cfg.skill_scope == "all":
++        parts.append(cfg.skill_text)
++    parts.append("Keep your answer under about 250 words.")
++    return "\n\n".join(parts)
++
++
++def _chair_system(cfg: CouncilConfig, base: str) -> str:
++    return base + ("\n\n" + cfg.skill_text if cfg.skill_text else "")
++
++
++def _msgs(system: str, user: str) -> List[Dict[str, str]]:
++    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
++
++
++def _label(i: int) -> str:
++    return f"Member {chr(ord('A') + i)}"
++
++
++def _panel(items: List[tuple]) -> str:
++    return "\n\n".join(f"[{name}]\n{text}" for name, text in items)
++
++
++# --------------------------------------------------------------------------- engine
++async def _safe_call(call: CallFn, ref: str, messages, temperature: float, max_tokens: int) -> _Result:
++    try:
++        text = await call(ref, messages, temperature, max_tokens)
++    except Exception as exc:  # one member failing must not sink the council
++        code = getattr(exc, "status_code", None)
++        return _Result(error=f"HTTP {code}" if isinstance(code, int) else type(exc).__name__)
++    text = (text or "").strip()
++    if not text:
++        return _Result(error="empty reply")
++    if looks_like_refusal(text):
++        return _Result(text=text, refused=True)
++    return _Result(text=text, ok=True)
++
++
++async def _round(members, build, call: CallFn, cfg: CouncilConfig, round_no: int, out: Dict[int, _Result]):
++    """Run members concurrently and yield an event as each one finishes."""
++    async def one(i: int):
++        m = members[i]
++        return i, await _safe_call(call, m.ref, build(i), m.temperature, cfg.member_max_tokens)
++
++    tasks = [asyncio.ensure_future(one(i)) for i in range(len(members))]
++    try:
++        for fut in asyncio.as_completed(tasks):
++            i, res = await fut
++            out[i] = res
++            m = members[i]
++            yield {"type": "member", "round": round_no, "name": m.display, "ref": m.ref, "text": res.text,
++                   "ok": res.ok, "refused": res.refused, "error": res.error}
++    finally:
++        for t in tasks:
++            t.cancel()
++
++
++async def run_council(question: str, cfg: CouncilConfig, call: CallFn) -> AsyncIterator[Dict[str, Any]]:
++    """Yield events: start, [draft], member*, round_done*, chair, done (or error)."""
++    if cfg.mode not in MODES:
++        yield {"type": "error", "message": f"Unknown council mode '{cfg.mode}'."}
++        return
++    if not cfg.members or len(cfg.members) > MAX_MEMBERS:
++        yield {"type": "error", "message": f"A council needs 1-{MAX_MEMBERS} members."}
++        return
++    if not cfg.chair:
++        yield {"type": "error", "message": "Pick a chair model."}
++        return
++
++    rng = random.Random(cfg.seed)
++    members = list(cfg.members)
++    n, rounds = len(members), max(1, min(cfg.rounds, MAX_ROUNDS))
++    calls = 0
++    yield {"type": "start", "mode": cfg.mode, "chair": cfg.chair, "rounds": rounds if cfg.mode == "debate" else 1,
++           "members": [{"name": m.display, "ref": m.ref} for m in members],
++           "estimate": plan(cfg.mode, n, rounds)}
++
++    draft = (cfg.draft or "").strip()
++    if cfg.mode == "verify" and not draft:
++        if not cfg.worker:
++            yield {"type": "error", "message": "Verify mode needs a worker model or an existing draft."}
++            return
++        res = await _safe_call(call, cfg.worker, _msgs(NEUTRAL, question), 0.4, cfg.chair_max_tokens)
++        calls += 1
++        yield {"type": "draft", "ref": cfg.worker, "text": res.text, "ok": res.ok, "refused": res.refused, "error": res.error}
++        if res.refused:
++            yield {"type": "error", "message": "The worker model declined the task, so there is no draft to verify."}
++            return
++        if not res.ok:
++            yield {"type": "error", "message": "The worker model produced no draft."}
++            return
++        draft = res.text
++
++    results: Dict[int, _Result] = {}
++    if cfg.mode == "verify":
++        def build_review(i: int):
++            m = members[i]
++            sys_prompt = (m.persona.prompt + "\n\n" if m.persona else "") + REVIEW_SYSTEM
++            if cfg.skill_text and cfg.skill_scope == "all":
++                sys_prompt += "\n\n" + cfg.skill_text
++            return _msgs(sys_prompt, f"Question:\n{question}\n\nDraft answer:\n{draft}")
++        build_first = build_review
++    else:
++        def build_first(i: int):
++            return _msgs(_system_for(cfg, members[i]), question)
++
++    async for ev in _round(members, build_first, call, cfg, 1, results):
++        calls += 1
++        yield ev
++    yield {"type": "round_done", "round": 1}
++
++    if cfg.mode == "debate":
++        for r in range(2, rounds + 1):
++            alive = [i for i in range(n) if results.get(i) and results[i].ok]
++            if len(alive) < 2:
++                break
++            snapshot = {i: results[i].text for i in alive}
++            new_results: Dict[int, _Result] = {}
++
++            def build_revise(k: int, _alive=alive, _snap=snapshot):
++                i = _alive[k]
++                others = [j for j in _alive if j != i]
++                rng.shuffle(others)
++                seen = _panel([(_label(x), _snap[j]) for x, j in enumerate(others)])
++                user = (f"Question:\n{question}\n\nYour answer so far:\n{_snap[i]}\n\nOther members said (anonymous):\n{seen}\n\n"
++                        "Revise your answer. Concede what is wrong, defend what is right, and name any disagreement that "
++                        "remains. Defer to the better argument, not to the majority.")
++                return _msgs(_system_for(cfg, members[i]), user)
++
++            sub = [members[i] for i in alive]
++            sub_out: Dict[int, _Result] = {}
++            async for ev in _round(sub, build_revise, call, cfg, r, sub_out):
++                calls += 1
++                yield ev
++            for k, i in enumerate(alive):
++                res = sub_out.get(k)
++                # keep the earlier answer if the revision failed or was declined
++                new_results[i] = res if (res and res.ok) else results[i]
++            results.update(new_results)
++            yield {"type": "round_done", "round": r}
++
++    answered = [i for i in range(n) if results.get(i) and results[i].ok]
++    declined = [i for i in range(n) if results.get(i) and results[i].refused]
++    if not answered:
++        yield {"type": "error", "message": "No member produced a usable answer."
++               + (f" {len(declined)} declined." if declined else "")}
++        return
++
++    order = answered[:]
++    rng.shuffle(order)
++    panel = _panel([(members[i].display if members[i].persona or members[i].label else _label(x), results[i].text)
++                    for x, i in enumerate(order)])
++    missing = n - len(answered)
++    note = f"\n\n({missing} member(s) could not answer or declined.)" if missing else ""
++    if cfg.mode == "verify":
++        user = f"Question:\n{question}\n\nDraft answer:\n{draft}\n\nReviews:\n{panel}{note}"
++        system = _chair_system(cfg, VERIFY_CHAIR_SYSTEM)
++    else:
++        user = f"Question:\n{question}\n\nMember answers:\n{panel}{note}"
++        system = _chair_system(cfg, CHAIR_SYSTEM)
++    final = await _safe_call(call, cfg.chair, _msgs(system, user), 0.3, cfg.chair_max_tokens)
++    calls += 1
++    if not final.text:
++        yield {"type": "error", "message": f"The chair produced no answer ({final.error or 'declined'})."}
++        return
++    yield {"type": "chair", "ref": cfg.chair, "text": final.text, "refused": final.refused}
++    yield {"type": "done", "calls": calls, "answered": len(answered), "declined": len(declined), "failed": n - len(answered) - len(declined)}
++
++
++# --------------------------------------------------------------------------- config parsing
++def config_from_dict(d: Dict[str, Any], skill_text: str = "") -> CouncilConfig:
++    """Validate a JSON body from the API. Raises ValueError with a presentable message."""
++    raw_members = d.get("members")
++    if not isinstance(raw_members, list) or not raw_members:
++        raise ValueError("members must be a non-empty list")
++    if len(raw_members) > MAX_MEMBERS:
++        raise ValueError(f"at most {MAX_MEMBERS} members")
++    by_name = {p.name.lower(): p for p in DEFAULT_PERSONAS}
++    members: List[Member] = []
++    for item in raw_members:
++        if not isinstance(item, dict):
++            raise ValueError("each member must be an object")
++        ref = str(item.get("ref") or f"{item.get('endpoint_id', '')}::{item.get('model', '')}")
++        if "::" not in ref or ref.startswith("::") or ref.endswith("::"):
++            raise ValueError("each member needs an endpoint_id and a model")
++        p = item.get("persona")
++        persona: Optional[Persona] = None
++        if isinstance(p, str) and p.strip():
++            persona = by_name.get(p.strip().lower())
++            if persona is None:
++                raise ValueError(f"unknown persona '{p}'")
++        elif isinstance(p, dict) and str(p.get("prompt") or "").strip():
++            persona = Persona(str(p.get("name") or "Member")[:40], str(p["prompt"])[:1500])
++        try:
++            temp = float(item.get("temperature", 0.8))
++        except (TypeError, ValueError):
++            temp = 0.8
++        members.append(Member(ref=ref, persona=persona, label=str(item.get("label") or "")[:40], temperature=min(max(temp, 0.0), 1.5)))
++    seen: Dict[str, int] = {}
++    for m in members:  # keep display names unique so the UI can tell members apart
++        base = m.display
++        seen[base] = seen.get(base, 0) + 1
++        if seen[base] > 1:
++            m.label = f"{base} {seen[base]}"
++    chair = str(d.get("chair") or "")
++    if "::" not in chair:
++        raise ValueError("chair must be 'endpoint_id::model'")
++    mode = str(d.get("mode") or "debate")
++    if mode not in MODES:
++        raise ValueError(f"mode must be one of {', '.join(MODES)}")
++    try:
++        rounds = int(d.get("rounds", 2))
++    except (TypeError, ValueError):
++        rounds = 2
++    scope = "all" if str(d.get("skill_scope") or "chair") == "all" else "chair"
++    return CouncilConfig(
++        members=members, chair=chair, mode=mode, rounds=max(1, min(rounds, MAX_ROUNDS)),
++        skill_text=skill_text, skill_scope=scope, worker=str(d.get("worker") or ""),
++        draft=str(d.get("draft") or "")[:20000],
++    )
+diff --git a/src/hub/provider_presets.py b/src/hub/provider_presets.py
+new file mode 100644
+index 00000000..1586137f
+--- /dev/null
++++ b/src/hub/provider_presets.py
+@@ -0,0 +1,464 @@
++"""Provider presets and key-based model discovery.
++
++The point: pick a provider, paste a key, see its models - no base-URL copy/paste
++(the Jan / AnythingLLM flow).
++
++Self-contained on purpose (httpx + stdlib only) so it can be unit-tested without the
++web app. It never touches the database and never logs keys. The HTTP layer lives in
++routes/hub_provider_routes.py; the chosen models are then saved through the *existing*
++``POST /api/model-endpoints`` route, which already supports pinned models, so the
++endpoint record, the key encryption and the model picker all behave as before.
++"""
++from __future__ import annotations
++
++import re
++from dataclasses import asdict, dataclass
++from typing import Any, Dict, List, Optional
++from urllib.parse import urljoin, urlparse
++
++import httpx
++
++_MAX_PAGES = 10
++
++
++# --------------------------------------------------------------------------- presets
++@dataclass(frozen=True)
++class ProviderPreset:
++    id: str
++    label: str
++    base_url: str
++    flavor: str = "openai"  # openai | openrouter | google | anthropic
++    needs_key: bool = True
++    local: bool = False
++    key_prefixes: tuple = ()
++    key_url: str = ""
++    note: str = ""
++
++
++PRESETS: tuple = (
++    ProviderPreset(
++        "openrouter", "OpenRouter", "https://openrouter.ai/api/v1", flavor="openrouter",
++        key_prefixes=("sk-or-",), key_url="https://openrouter.ai/keys",
++        note="One key, hundreds of models. Free models are detected from the pricing data.",
++    ),
++    ProviderPreset(
++        "google", "Google Gemini", "https://generativelanguage.googleapis.com/v1beta/openai",
++        flavor="google", key_prefixes=("AIza",), key_url="https://aistudio.google.com/apikey",
++        note="Use an AI Studio key. Whether a model is free depends on your quota, so it is not flagged.",
++    ),
++    ProviderPreset(
++        "openai", "OpenAI", "https://api.openai.com/v1",
++        key_prefixes=("sk-",), key_url="https://platform.openai.com/api-keys",
++    ),
++    ProviderPreset(
++        "anthropic", "Anthropic", "https://api.anthropic.com/v1", flavor="anthropic",
++        key_prefixes=("sk-ant-",), key_url="https://console.anthropic.com/settings/keys",
++    ),
++    ProviderPreset(
++        "groq", "Groq", "https://api.groq.com/openai/v1",
++        key_prefixes=("gsk_",), key_url="https://console.groq.com/keys",
++    ),
++    ProviderPreset(
++        "mistral", "Mistral", "https://api.mistral.ai/v1",
++        key_url="https://console.mistral.ai/api-keys",
++    ),
++    ProviderPreset(
++        "deepseek", "DeepSeek", "https://api.deepseek.com/v1",
++        key_prefixes=("sk-",), key_url="https://platform.deepseek.com/api_keys",
++    ),
++    ProviderPreset(
++        "together", "Together AI", "https://api.together.xyz/v1",
++        key_url="https://api.together.ai/settings/api-keys",
++    ),
++    ProviderPreset(
++        "cerebras", "Cerebras", "https://api.cerebras.ai/v1",
++        key_prefixes=("csk-",), key_url="https://cloud.cerebras.ai",
++    ),
++    ProviderPreset(
++        "nvidia", "NVIDIA NIM", "https://integrate.api.nvidia.com/v1",
++        key_prefixes=("nvapi-",), key_url="https://build.nvidia.com",
++    ),
++    ProviderPreset(
++        "xai", "xAI", "https://api.x.ai/v1",
++        key_prefixes=("xai-",), key_url="https://console.x.ai",
++    ),
++    ProviderPreset(
++        "huggingface", "Hugging Face", "https://router.huggingface.co/v1",
++        key_prefixes=("hf_",), key_url="https://huggingface.co/settings/tokens",
++    ),
++    ProviderPreset(
++        "ollama", "Ollama (local)", "http://localhost:11434/v1",
++        needs_key=False, local=True,
++        note="Offline model on this machine. Inside Docker the host is rewritten automatically.",
++    ),
++    ProviderPreset(
++        "lmstudio", "LM Studio (local)", "http://localhost:1234/v1",
++        needs_key=False, local=True,
++        note="Offline model on this machine. Start LM Studio's local server first.",
++    ),
++    ProviderPreset(
++        "custom", "Other (OpenAI-compatible URL)", "", needs_key=False,
++        note="Any OpenAI-compatible server. Paste its base URL; the key is optional.",
++    ),
++)
++
++_BY_ID = {p.id: p for p in PRESETS}
++
++
++def get_preset(preset_id: str) -> Optional[ProviderPreset]:
++    return _BY_ID.get((preset_id or "").strip().lower())
++
++
++def public_presets() -> List[Dict[str, Any]]:
++    """JSON-ready preset list for the UI (no secrets live here)."""
++    return [asdict(p) for p in PRESETS]
++
++
++# Order matters: the longer / more specific prefixes first.
++_PREFIX_RULES = (
++    ("sk-or-", "openrouter"),
++    ("sk-ant-", "anthropic"),
++    ("AIza", "google"),
++    ("gsk_", "groq"),
++    ("xai-", "xai"),
++    ("nvapi-", "nvidia"),
++    ("hf_", "huggingface"),
++    ("csk-", "cerebras"),
++)
++
++
++def guess_provider(api_key: str) -> List[str]:
++    """Best-effort provider guess from a key's prefix.
++
++    Returns one id when the prefix is distinctive, several when it is ambiguous (plain
++    ``sk-`` is used by OpenAI and DeepSeek, among others), and ``[]`` when unknown.
++    The UI only pre-selects a provider; the user always has the final say.
++    """
++    key = (api_key or "").strip()
++    for prefix, preset_id in _PREFIX_RULES:
++        if key.startswith(prefix):
++            return [preset_id]
++    if key.startswith("sk-"):
++        return ["openai", "deepseek"]
++    return []
++
++
++# --------------------------------------------------------------------------- model cards
++@dataclass
++class ModelCard:
++    id: str
++    name: str = ""
++    context_length: Optional[int] = None
++    free: Optional[bool] = None  # only known where the provider publishes pricing (OpenRouter)
++    vision: Optional[bool] = None
++    tools: Optional[bool] = None
++    reasoning: Optional[bool] = None
++    local: bool = False
++
++
++class DiscoveryError(Exception):
++    """A user-presentable failure. Never contains the key or a response body."""
++
++    def __init__(self, message: str, status: Optional[int] = None):
++        super().__init__(message)
++        self.message = message
++        self.status = status
++
++
++@dataclass
++class Discovery:
++    cards: List[ModelCard]
++    key_info: Optional[Dict[str, Any]] = None  # e.g. {"is_free_tier": True, "label": "sk-or-v1-abc...xyz"}
++
++
++_NON_CHAT = re.compile(
++    r"(embed|whisper|tts|dall-e|moderation|rerank|imagen|veo-|stable-diffusion|sdxl|flux|transcribe|speech)",
++    re.I,
++)
++_NON_CHAT_TYPES = {"embedding", "image", "moderation", "rerank", "audio", "transcribe", "video", "tts"}
++_CTX_KEYS = ("context_length", "context_window", "max_context_length", "max_model_len", "n_ctx")
++
++
++def _int_or_none(value: Any) -> Optional[int]:
++    try:
++        n = int(value)
++    except (TypeError, ValueError):
++        return None
++    return n if n > 0 else None
++
++
++def _is_zero_price(value: Any) -> bool:
++    try:
++        return float(value) == 0.0
++    except (TypeError, ValueError):
++        return False
++
++
++# --------------------------------------------------------------------------- parsers
++def parse_openrouter(data: Any) -> List[ModelCard]:
++    items = data.get("data") if isinstance(data, dict) else data
++    cards: List[ModelCard] = []
++    for m in items or []:
++        if not isinstance(m, dict):
++            continue
++        mid = m.get("id")
++        if not isinstance(mid, str) or not mid:
++            continue
++        arch = m.get("architecture") if isinstance(m.get("architecture"), dict) else {}
++        outs = arch.get("output_modalities")
++        if isinstance(outs, list) and "text" not in outs:
++            continue  # image/audio-only generators are not chat models
++        ins = arch.get("input_modalities") if isinstance(arch.get("input_modalities"), list) else []
++        params = m.get("supported_parameters") if isinstance(m.get("supported_parameters"), list) else []
++        pricing = m.get("pricing") if isinstance(m.get("pricing"), dict) else None
++        if mid.endswith(":free"):
++            free: Optional[bool] = True
++        elif pricing is None:
++            free = None
++        else:
++            free = _is_zero_price(pricing.get("prompt")) and _is_zero_price(pricing.get("completion"))
++        cards.append(ModelCard(
++            id=mid,
++            name=str(m.get("name") or mid),
++            context_length=_int_or_none(m.get("context_length")),
++            free=free,
++            vision="image" in ins,
++            tools="tools" in params,
++            reasoning=("reasoning" in params) or ("include_reasoning" in params),
++        ))
++    return cards
++
++
++def parse_google(data: Any) -> List[ModelCard]:
++    cards: List[ModelCard] = []
++    for item in (data.get("models") if isinstance(data, dict) else None) or []:
++        if not isinstance(item, dict):
++            continue
++        methods = item.get("supportedGenerationMethods")
++        if not isinstance(methods, list) or "generateContent" not in methods:
++            continue
++        raw = str(item.get("baseModelId") or item.get("name") or "").strip()
++        mid = raw[len("models/"):] if raw.startswith("models/") else raw
++        if not mid or _NON_CHAT.search(mid):
++            continue
++        cards.append(ModelCard(
++            id=mid,
++            name=str(item.get("displayName") or mid),
++            context_length=_int_or_none(item.get("inputTokenLimit")),
++        ))
++    return cards
++
++
++def parse_anthropic(data: Any) -> List[ModelCard]:
++    cards: List[ModelCard] = []
++    for m in (data.get("data") if isinstance(data, dict) else None) or []:
++        if isinstance(m, dict) and isinstance(m.get("id"), str) and m["id"]:
++            cards.append(ModelCard(id=m["id"], name=str(m.get("display_name") or m["id"])))
++    return cards
++
++
++def parse_openai_style(data: Any, *, local: bool = False) -> List[ModelCard]:
++    items = data if isinstance(data, list) else ((data or {}).get("data") if isinstance(data, dict) else None)
++    cards: List[ModelCard] = []
++    seen = set()
++    for m in items or []:
++        if not isinstance(m, dict):
++            continue
++        mid = m.get("id")
++        if not isinstance(mid, str) or not mid or mid in seen or _NON_CHAT.search(mid):
++            continue
++        if str(m.get("type") or "").lower() in _NON_CHAT_TYPES:
++            continue
++        seen.add(mid)
++        ctx = next((_int_or_none(m.get(k)) for k in _CTX_KEYS if _int_or_none(m.get(k))), None)
++        cards.append(ModelCard(id=mid, name=str(m.get("name") or m.get("display_name") or mid),
++                               context_length=ctx, local=local))
++    return cards
++
++
++# --------------------------------------------------------------------------- fetching
++def _friendly_status(label: str, status: int) -> DiscoveryError:
++    if status == 401:
++        return DiscoveryError(f"{label} rejected this key (HTTP 401). Check that it is a valid key for {label}.", status)
++    if status == 403:
++        return DiscoveryError(
++            f"{label} refused the request (HTTP 403). The key may be invalid or lack access, or a firewall/proxy may be blocking the connection.",
++            status,
++        )
++    if status == 404:
++        return DiscoveryError(f"{label} has no model list at that address (HTTP 404). Check the base URL.", status)
++    if status == 429:
++        return DiscoveryError(f"{label} is rate-limiting requests (HTTP 429). Wait a moment and try again.", status)
++    return DiscoveryError(f"{label} answered with HTTP {status}.", status)
++
++
++async def _get_json(client: httpx.AsyncClient, url: str, headers: Dict[str, str], params: Optional[dict], label: str) -> Any:
++    try:
++        r = await client.get(url, headers=headers, params=params)
++    except httpx.TimeoutException:
++        raise DiscoveryError(f"Timed out reaching {urlparse(url).hostname}.")
++    except httpx.HTTPError as e:
++        raise DiscoveryError(f"Could not reach {urlparse(url).hostname}: {type(e).__name__}.")
++    if r.status_code >= 400:
++        raise _friendly_status(label, r.status_code)
++    try:
++        return r.json()
++    except ValueError:
++        raise DiscoveryError(f"{label} did not return a model list (response was not JSON).")
++
++
++def _same_host(a: str, b: str) -> bool:
++    return (urlparse(a).hostname or "").lower() == (urlparse(b).hostname or "").lower()
++
++
++async def _openrouter_key_info(client: httpx.AsyncClient, base: str, key: str) -> Optional[Dict[str, Any]]:
++    """Validate the key with OpenRouter's GET /key (the model list itself is public, so a typo'd key
++    would otherwise look fine until the first chat). Only an explicit 401/403 is treated as a bad key;
++    anything else (network blip, endpoint change) just means "no extra info"."""
++    try:
++        r = await client.get(base.rstrip("/") + "/key", headers={"Authorization": f"Bearer {key}", "Accept": "application/json"})
++    except httpx.HTTPError:
++        return None
++    if r.status_code in (401, 403):
++        raise _friendly_status("OpenRouter", r.status_code)
++    if r.status_code >= 400:
++        return None
++    try:
++        data = (r.json() or {}).get("data") or {}
++    except ValueError:
++        return None
++    if not isinstance(data, dict):
++        return None
++    label = str(data.get("label") or "")
++    free_tier = data.get("is_free_tier")
++    return {
++        "is_free_tier": free_tier if isinstance(free_tier, bool) else None,
++        "label": label[:48] if label and key not in label else None,
++    }
++
++
++async def _fetch_openrouter(client, preset: ProviderPreset, base: str, key: str) -> List[ModelCard]:
++    headers = {"Accept": "application/json"}
++    if key:
++        headers["Authorization"] = f"Bearer {key}"
++    url, cards, seen = base.rstrip("/") + "/models", [], set()
++    for _ in range(_MAX_PAGES):
++        data = await _get_json(client, url, headers, None, preset.label)
++        for c in parse_openrouter(data):
++            if c.id not in seen:
++                seen.add(c.id)
++                cards.append(c)
++        nxt = ((data.get("links") or {}).get("next")) if isinstance(data, dict) else None
++        if not nxt:
++            break
++        nxt_url = urljoin(base.rstrip("/") + "/", nxt) if not str(nxt).startswith("http") else str(nxt)
++        if not _same_host(nxt_url, base):  # never follow a pagination link to another host
++            break
++        url = nxt_url
++    return cards
++
++
++async def _fetch_google(client, preset: ProviderPreset, base: str, key: str) -> List[ModelCard]:
++    root = base.rstrip("/")
++    if root.endswith("/openai"):
++        root = root[: -len("/openai")]
++    headers = {"Accept": "application/json", "x-goog-api-key": key}
++    cards, seen, token = [], set(), ""
++    for _ in range(_MAX_PAGES):
++        params: Dict[str, Any] = {"pageSize": 1000}
++        if token:
++            params["pageToken"] = token
++        data = await _get_json(client, root + "/models", headers, params, preset.label)
++        for c in parse_google(data):
++            if c.id not in seen:
++                seen.add(c.id)
++                cards.append(c)
++        token = str((data or {}).get("nextPageToken") or "") if isinstance(data, dict) else ""
++        if not token:
++            break
++    return cards
++
++
++async def _fetch_anthropic(client, preset: ProviderPreset, base: str, key: str) -> List[ModelCard]:
++    root = base.rstrip("/")
++    if root.endswith("/v1"):
++        root = root[:-3]
++    headers = {"Accept": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01"}
++    cards, seen, after = [], set(), ""
++    for _ in range(_MAX_PAGES):
++        params: Dict[str, Any] = {"limit": 1000}
++        if after:
++            params["after_id"] = after
++        data = await _get_json(client, root + "/v1/models", headers, params, preset.label)
++        for c in parse_anthropic(data):
++            if c.id not in seen:
++                seen.add(c.id)
++                cards.append(c)
++        after = str((data or {}).get("last_id") or "") if isinstance(data, dict) else ""
++        if not (isinstance(data, dict) and data.get("has_more") and after):
++            break
++    return cards
++
++
++async def _fetch_openai_style(client, preset: ProviderPreset, base: str, key: str) -> List[ModelCard]:
++    headers = {"Accept": "application/json"}
++    if key:
++        headers["Authorization"] = f"Bearer {key}"
++    data = await _get_json(client, base.rstrip("/") + "/models", headers, None, preset.label)
++    return parse_openai_style(data, local=preset.local)
++
++
++_FETCHERS = {
++    "openrouter": _fetch_openrouter,
++    "google": _fetch_google,
++    "anthropic": _fetch_anthropic,
++    "openai": _fetch_openai_style,
++}
++
++
++async def discover(
++    preset_id: str,
++    api_key: str = "",
++    base_url: str = "",
++    *,
++    client: Optional[httpx.AsyncClient] = None,
++    timeout: float = 20.0,
++    verify: Any = True,
++) -> Discovery:
++    """List the chat models a key can use, plus key info where the provider offers it.
++
++    ``base_url`` overrides the preset's address (needed for ``custom``, and useful for
++    self-hosted proxies). Raises :class:`DiscoveryError` with a message safe to show.
++    """
++    preset = get_preset(preset_id)
++    if preset is None:
++        raise DiscoveryError(f"Unknown provider '{preset_id}'.")
++    key = (api_key or "").strip()
++    if preset.needs_key and not key:
++        raise DiscoveryError(f"Paste your {preset.label} API key first.")
++    base = (base_url or preset.base_url or "").strip()
++    if not base:
++        raise DiscoveryError("A base URL is required for this provider.")
++    if not re.match(r"^https?://", base, re.I):
++        raise DiscoveryError("The base URL must start with http:// or https://")
++
++    fetch = _FETCHERS.get(preset.flavor, _fetch_openai_style)
++    owns_client = client is None
++    if owns_client:
++        client = httpx.AsyncClient(timeout=timeout, verify=verify, follow_redirects=False)
++    key_info: Optional[Dict[str, Any]] = None
++    try:
++        if preset.flavor == "openrouter" and key:
++            key_info = await _openrouter_key_info(client, base, key)  # fail fast on a bad key
++        cards = await fetch(client, preset, base, key)
++    finally:
++        if owns_client:
++            await client.aclose()
++    if not cards:
++        raise DiscoveryError(f"{preset.label} returned no chat models for this key.")
++    return Discovery(cards=cards, key_info=key_info)
++
++
++async def discover_models(preset_id: str, api_key: str = "", base_url: str = "", **kw: Any) -> List[ModelCard]:
++    """Convenience wrapper around :func:`discover` that returns only the model cards."""
++    return (await discover(preset_id, api_key, base_url, **kw)).cards
+diff --git a/tests/test_hub_auto_router.py b/tests/test_hub_auto_router.py
+new file mode 100644
+index 00000000..f8bfbba8
+--- /dev/null
++++ b/tests/test_hub_auto_router.py
+@@ -0,0 +1,254 @@
++"""Auto mode: pool prefilter, router pick, degradation, refusal detection, fallback chain."""
++import asyncio
++
++import pytest
++
++from src.hub import auto_router as ar
++
++
++def E(ep, model, **kw):
++    return ar.PoolEntry(endpoint_id=ep, model=model, **kw)
++
++
++def pool():
++    return [
++        E("or", "meta/llama:free", label="Llama Free", free=True, context_length=131072, vision=False, tools=True),
++        E("or", "qwen/coder:free", label="Qwen Coder Free", free=True, context_length=32768, vision=False, tags=("code",)),
++        E("gem", "gemini-flash", label="Gemini Flash", context_length=1_000_000, vision=True),
++        E("loc", "qwen3:4b", label="Qwen3 4B", local=True, context_length=8192),
++    ]
++
++
++def refs(entries):
++    return [e.model for e in entries]
++
++
++# --------------------------------------------------------------------------- refs / entries
++def test_split_ref_keeps_colons_in_model_ids():
++    assert ar.split_ref("loc::qwen3:4b") == ("loc", "qwen3:4b")
++    assert ar.split_ref("nothing") == ("nothing", "")
++    assert E("loc", "qwen3:4b").ref == "loc::qwen3:4b"
++
++
++def test_pool_entry_from_dict_normalises_tags():
++    e = ar.PoolEntry.from_dict({"endpoint_id": "x", "model": "m", "tags": " Code , Fast ,", "local": 1})
++    assert e.tags == ("code", "fast") and e.local is True
++
++
++# --------------------------------------------------------------------------- prefilter
++def test_keep_local_is_a_hard_filter():
++    cands, notes = ar.prefilter(ar.TaskInfo("hello", keep_local=True), pool())
++    assert refs(cands) == ["qwen3:4b"] and "keep-local" in notes
++
++
++def test_keep_local_with_no_local_model_raises_instead_of_falling_back_to_cloud():
++    cloud_only = [e for e in pool() if not e.local]
++    with pytest.raises(ar.NoRouteError, match="no offline model"):
++        ar.prefilter(ar.TaskInfo("hello", keep_local=True), cloud_only)
++
++
++def test_vision_prefers_models_that_are_not_known_text_only():
++    cands, notes = ar.prefilter(ar.TaskInfo("what is in this picture", has_image=True), pool())
++    assert refs(cands) == ["gemini-flash", "qwen3:4b"]  # unknown (None) is kept, known-False is dropped
++    assert "vision" in notes
++
++
++def test_soft_filters_are_ignored_when_nothing_would_match():
++    only_text = [e for e in pool() if e.vision is False]
++    cands, notes = ar.prefilter(ar.TaskInfo("img", has_image=True), only_text)
++    assert refs(cands) == refs(only_text)
++    assert any("no model matched" in n for n in notes)
++
++
++def test_long_prompts_drop_models_with_too_small_a_context_window():
++    task = ar.TaskInfo("x" * 40_000)  # ~10k tokens, needs ~16k
++    cands, notes = ar.prefilter(task, pool())
++    assert "qwen3:4b" not in refs(cands) and "context-length" in notes
++
++
++def test_exclude_skips_models_already_tried_and_errors_when_none_are_left():
++    cands, notes = ar.prefilter(ar.TaskInfo("hi"), pool(), exclude=["or::meta/llama:free"])
++    assert "meta/llama:free" not in refs(cands) and any("already tried" in n for n in notes)
++    with pytest.raises(ar.NoRouteError, match="No other model"):
++        ar.prefilter(ar.TaskInfo("hi"), pool(), exclude=[e.ref for e in pool()])
++
++
++def test_empty_pool_and_incomplete_entries_are_not_candidates():
++    with pytest.raises(ar.NoRouteError):
++        asyncio.run(ar.route(ar.TaskInfo("hi"), [E("", "m"), E("ep", "")], None))
++
++
++# --------------------------------------------------------------------------- parse_pick
++@pytest.mark.parametrize("text,n,expected", [
++    ('{"pick": 2, "reason": "code task"}', 4, (2, "code task")),
++    ('```json\n{"pick": 3}\n```', 4, (3, "")),
++    ('Sure! {"pick": 1, "reason": "small"} hope that helps', 4, (1, "small")),
++    ('pick: 4', 4, (4, "")),
++    ('"pick" = 2', 4, (2, "")),
++    ("3", 4, (3, "")),
++    ('{"pick": "2"}', 4, (2, "")),
++    ('{"pick": 9}', 4, (None, "")),     # out of range
++    ('{"pick": 0}', 4, (None, "")),
++    ('{"pick": "two"}', 4, (None, "")),
++    ("I would choose the second one", 4, (None, "")),
++    ("", 4, (None, "")),
++])
++def test_parse_pick(text, n, expected):
++    assert ar.parse_pick(text, n) == expected
++
++
++# --------------------------------------------------------------------------- route
++async def test_single_candidate_never_calls_the_router():
++    called = []
++
++    async def router(msgs):
++        called.append(msgs)
++        return '{"pick": 1}'
++
++    d = await ar.route(ar.TaskInfo("hi", keep_local=True), pool(), router)
++    assert d.source == "only-candidate" and d.entry.model == "qwen3:4b" and not called
++
++
++async def test_router_pick_is_used_with_its_reason():
++    async def router(msgs):
++        return '{"pick": 2, "reason": "code task"}'
++
++    d = await ar.route(ar.TaskInfo("write a python function"), pool(), router)
++    assert d.source == "router" and d.entry.model == "qwen/coder:free" and d.reason == "code task"
++    assert len(d.candidates) == 4
++
++
++@pytest.mark.parametrize("behaviour", ["raise", "garbage", "out_of_range", "slow"])
++async def test_router_problems_degrade_to_the_default_instead_of_failing(behaviour):
++    async def router(msgs):
++        if behaviour == "raise":
++            raise RuntimeError("429")
++        if behaviour == "slow":
++            await asyncio.sleep(1)
++        return {"garbage": "no idea", "out_of_range": '{"pick": 99}', "slow": '{"pick": 1}'}.get(behaviour, "")
++
++    d = await ar.route(ar.TaskInfo("hi"), pool(), router, default_ref="gem::gemini-flash", timeout=0.05)
++    assert d.source == "fallback" and d.entry.model == "gemini-flash"
++
++
++async def test_no_router_uses_pool_order_when_there_is_no_default():
++    d = await ar.route(ar.TaskInfo("hi"), pool(), None)
++    assert d.source == "fallback" and d.entry.model == "meta/llama:free"
++
++
++async def test_keep_local_router_prompt_never_mentions_cloud_models():
++    seen = []
++
++    async def router(msgs):
++        seen.append(msgs)
++        return '{"pick": 1}'
++
++    local_pool = pool() + [E("loc", "phi4-mini", label="Phi4 Mini", local=True)]
++    d = await ar.route(ar.TaskInfo("private notes", keep_local=True), local_pool, router)
++    text = " ".join(m["content"] for m in seen[0])
++    assert "Qwen3 4B" in text and "Phi4 Mini" in text
++    for cloud in ("Llama Free", "Gemini Flash", "Qwen Coder Free"):
++        assert cloud not in text
++    assert d.entry.local is True
++
++
++def test_router_prompt_truncates_long_messages_but_keeps_both_ends():
++    msg = "START" + "m" * 5000 + "END"
++    out = ar.build_router_messages(ar.TaskInfo(msg), pool())[1]["content"]
++    assert "START" in out and "END" in out and len(out) < 2500
++    assert ar.build_router_messages(ar.TaskInfo("x"), pool())[0]["role"] == "system"
++
++
++# --------------------------------------------------------------------------- refusals
++@pytest.mark.parametrize("text", [
++    "I'm sorry, but I can't help with that request.",
++    "I cannot assist with this.",
++    "I can't help with that.",
++    "Sorry, I must decline.",
++    "I am unable to provide that information.",
++    "As an AI language model, I cannot do that.",
++    "  I won't help with this.  ",
++])
++def test_refusal_openers_are_detected(text):
++    assert ar.looks_like_refusal(text)
++
++
++@pytest.mark.parametrize("text", [
++    "",
++    "OK",
++    "Sure! Here is the plan. I can't stress enough how important backups are.",
++    "The patient said she cannot sleep, so here is what the literature suggests...",
++    "I cannot help with the exact request, but here is a detailed alternative: " + "x" * 800,  # long answers are left alone
++])
++def test_normal_answers_are_not_flagged(text):
++    assert not ar.looks_like_refusal(text)
++
++
++def test_provider_signals_count_even_when_the_text_is_unremarkable():
++    assert ar.looks_like_refusal("whatever", finish_reason="content_filter")
++    assert ar.looks_like_refusal("whatever", stop_reason="refusal")
++    assert not ar.looks_like_refusal("whatever", finish_reason="stop")
++
++
++# --------------------------------------------------------------------------- fallback chain
++def _caller(script, seen=None):
++    async def call(entry, messages):
++        if seen is not None:
++            seen.append((entry.model, messages))
++        outcome = script[entry.model]
++        if isinstance(outcome, Exception):
++            raise outcome
++        return outcome
++    return call
++
++
++MSGS = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
++REFUSAL = "I'm sorry, but I can't help with that."
++
++
++async def test_error_moves_on_to_the_next_model():
++    entries = pool()[:2]
++    r = await ar.answer_with_fallback(entries, _caller({"meta/llama:free": RuntimeError("503"), "qwen/coder:free": "fine"}), MSGS)
++    assert r.text == "fine" and r.entry.model == "qwen/coder:free"
++    assert [(a.entry.model, a.outcome) for a in r.attempts] == [("meta/llama:free", "error"), ("qwen/coder:free", "ok")]
++
++
++async def test_a_refusal_is_accepted_as_the_answer_unless_fallback_on_refusal_is_enabled():
++    entries = pool()[:2]
++    r = await ar.answer_with_fallback(entries, _caller({"meta/llama:free": REFUSAL, "qwen/coder:free": "fine"}), MSGS)
++    assert r.text == REFUSAL and r.entry.model == "meta/llama:free" and len(r.attempts) == 1
++
++
++async def test_on_refusal_moves_on_and_reports_every_attempt():
++    entries = pool()[:3]
++    r = await ar.answer_with_fallback(
++        entries, _caller({"meta/llama:free": REFUSAL, "qwen/coder:free": REFUSAL, "gemini-flash": "ok"}), MSGS, on_refusal=True)
++    assert r.text == "ok" and not r.all_declined
++    assert [a.outcome for a in r.attempts] == ["refused", "refused", "ok"]
++
++
++async def test_if_everyone_declines_the_first_refusal_is_returned_not_hidden():
++    entries = pool()[:2]
++    r = await ar.answer_with_fallback(
++        entries, _caller({"meta/llama:free": REFUSAL, "qwen/coder:free": "I cannot assist with this."}), MSGS, on_refusal=True)
++    assert r.all_declined and r.text == REFUSAL and r.entry.model == "meta/llama:free"
++
++
++async def test_everything_failing_returns_an_empty_result_and_on_error_false_raises():
++    entries = pool()[:2]
++    boom = {"meta/llama:free": RuntimeError("a"), "qwen/coder:free": RuntimeError("b")}
++    r = await ar.answer_with_fallback(entries, _caller(boom), MSGS)
++    assert r.text == "" and r.entry is None and not r.all_declined
++    with pytest.raises(RuntimeError):
++        await ar.answer_with_fallback(entries, _caller(boom), MSGS, on_error=False)
++
++
++async def test_every_model_receives_the_same_unmodified_messages():
++    seen = []
++    entries = pool()[:3]
++    snapshot = [dict(m) for m in MSGS]
++    await ar.answer_with_fallback(
++        entries, _caller({"meta/llama:free": REFUSAL, "qwen/coder:free": REFUSAL, "gemini-flash": "ok"}, seen), MSGS, on_refusal=True)
++    assert len(seen) == 3
++    assert all(m == snapshot for _model, m in seen)   # no rewording to get past a refusal
++    assert MSGS == snapshot
+diff --git a/tests/test_hub_council.py b/tests/test_hub_council.py
+new file mode 100644
+index 00000000..381df716
+--- /dev/null
++++ b/tests/test_hub_council.py
+@@ -0,0 +1,287 @@
++"""Council: fan-out / debate / verify with a fake model call (no network)."""
++import asyncio
++import time
++
++import pytest
++
++from src.hub import council as cn
++
++REFUSAL = "I'm sorry, but I can't help with that."
++P = cn.DEFAULT_PERSONAS  # Researcher, Logician, Contrarian, Builder
++
++
++class FakeLLM:
++    """Records every call; replies are scripted per ref, per call number, or default to a tagged string."""
++
++    def __init__(self, fail=(), refuse=(), fail_on=(), delays=None, chair_reply=None, worker_reply=None, worker_ref=None):
++        self.calls = []                    # (ref, system, user)
++        self.count = {}
++        self.fail, self.refuse, self.fail_on = set(fail), set(refuse), set(fail_on)
++        self.delays = delays or {}
++        self.chair_reply, self.worker_reply, self.worker_ref = chair_reply, worker_reply, worker_ref
++
++    async def __call__(self, ref, messages, temperature, max_tokens):
++        n = self.count[ref] = self.count.get(ref, 0) + 1
++        self.calls.append((ref, messages[0]["content"], messages[1]["content"]))
++        if self.delays.get(ref):
++            await asyncio.sleep(self.delays[ref])
++        if ref in self.fail or (ref, n) in self.fail_on:
++            raise RuntimeError("boom")
++        if ref in self.refuse:
++            return REFUSAL
++        if ref == self.worker_ref and self.worker_reply is not None:
++            return self.worker_reply
++        if ref == "chair::c" and self.chair_reply is not None:
++            return self.chair_reply
++        return f"ANSWER[{ref}#{n}]"
++
++    def for_ref(self, ref):
++        return [c for c in self.calls if c[0] == ref]
++
++
++def members(n=4, personas=True):
++    return [cn.Member(ref=f"m{i}::model", persona=P[i] if personas else None) for i in range(n)]
++
++
++def cfg(mode="debate", n=4, **kw):
++    kw.setdefault("seed", 7)
++    return cn.CouncilConfig(members=members(n, kw.pop("personas", True)), chair="chair::c", mode=mode, **kw)
++
++
++async def run(config, fake, question="Q?"):
++    return [ev async for ev in cn.run_council(question, config, fake)]
++
++
++def kinds(events):
++    return [e["type"] for e in events]
++
++
++# --------------------------------------------------------------------------- cost model
++def test_plan_numbers_match_the_hand_calculation():
++    d = cn.plan("debate", 4, 2)
++    assert (d["calls"], d["tokens"], d["x_single_call"]) == (9, 13270, 19.0)
++    f = cn.plan("fanout", 4, 2)
++    assert (f["calls"], f["tokens"], f["x_single_call"]) == (5, 5190, 7.4)
++    v = cn.plan("verify", 4, 2)
++    assert v["calls"] == 6                   # worker + 4 reviewers + chair
++    assert cn.plan("debate", 4, 3)["calls"] == 13
++    # the point of the model: debate costs far more tokens than calls suggest, because prompts carry everyone's answers
++    assert d["tokens"] / f["tokens"] > d["calls"] / f["calls"]
++
++
++# --------------------------------------------------------------------------- fanout / debate
++async def test_fanout_runs_each_member_once_then_the_chair():
++    fake = FakeLLM()
++    ev = await run(cfg("fanout"), fake)
++    assert kinds(ev) == ["start", "member", "member", "member", "member", "round_done", "chair", "done"]
++    assert len(fake.calls) == 5 and ev[-1]["calls"] == 5
++    chair_user = fake.for_ref("chair::c")[0][2]
++    for i in range(4):
++        assert f"ANSWER[m{i}::model#1]" in chair_user
++    assert fake.for_ref("chair::c")[0][1].startswith(cn.CHAIR_SYSTEM)
++    assert ev[0]["estimate"]["calls"] == 5
++
++
++async def test_debate_makes_n_times_rounds_plus_one_calls():
++    fake = FakeLLM()
++    ev = await run(cfg("debate", rounds=2), fake)
++    assert len(fake.calls) == 9 and ev[-1]["calls"] == 9
++    assert [e["round"] for e in ev if e["type"] == "round_done"] == [1, 2]
++
++
++async def test_rounds_are_clamped_to_the_maximum():
++    fake = FakeLLM()
++    await run(cfg("debate", rounds=99), fake)
++    assert len(fake.calls) == 4 * cn.MAX_ROUNDS + 1
++
++
++async def test_round_two_shows_others_anonymously_and_never_by_persona_name():
++    fake = FakeLLM()
++    await run(cfg("debate", rounds=2), fake)
++    second = fake.for_ref("m0::model")[1]
++    system, user = second[1], second[2]
++    assert "ANSWER[m0::model#1]" in user                              # its own previous answer
++    for i in (1, 2, 3):
++        assert f"ANSWER[m{i}::model#1]" in user                       # everyone else's answer
++    for other in ("Logician", "Contrarian", "Builder"):
++        assert other not in user                                      # identities hidden from the reader
++    assert "Member A" in user and "Member C" in user and "Member D" not in user
++    assert "Researcher" in system                                     # its own persona stays in its system prompt
++    assert "better argument, not to the majority" in user
++
++
++async def test_shuffle_is_seeded_and_changes_with_the_seed():
++    outs = []
++    for seed in (1, 1, 2, 3, 4, 5):
++        fake = FakeLLM()
++        await run(cfg("debate", rounds=2, seed=seed), fake)
++        outs.append(fake.for_ref("chair::c")[0][2])
++    assert outs[0] == outs[1]                  # same seed -> same chair prompt
++    assert len(set(outs)) > 1                  # different seeds -> different panel order
++
++
++async def test_members_run_concurrently_and_events_stream_in_completion_order():
++    fake = FakeLLM(delays={"m0::model": 0.15, "m1::model": 0.01, "m2::model": 0.08})
++    start = time.perf_counter()
++    ev = await run(cfg("fanout", n=3), fake)
++    elapsed = time.perf_counter() - start
++    assert [e["ref"] for e in ev if e["type"] == "member"] == ["m1::model", "m2::model", "m0::model"]
++    assert elapsed < 0.30                       # sequential would be >= 0.24 + chair; parallel is ~0.15
++
++
++async def test_members_without_personas_are_anonymous_to_the_chair():
++    fake = FakeLLM()
++    await run(cfg("fanout", personas=False), fake)
++    user = fake.for_ref("chair::c")[0][2]
++    assert "[Member A]" in user and "Researcher" not in user
++
++
++# --------------------------------------------------------------------------- failures and refusals
++async def test_a_failing_member_does_not_sink_the_council():
++    fake = FakeLLM(fail={"m1::model"})
++    ev = await run(cfg("fanout"), fake)
++    done = ev[-1]
++    assert done["type"] == "done" and (done["answered"], done["failed"], done["declined"]) == (3, 1, 0)
++    failed = [e for e in ev if e["type"] == "member" and e["ref"] == "m1::model"][0]
++    assert failed["ok"] is False and failed["error"] == "RuntimeError"
++    assert "1 member(s) could not answer or declined" in fake.for_ref("chair::c")[0][2]
++
++
++async def test_a_refusing_member_is_reported_and_kept_out_of_the_panel():
++    fake = FakeLLM(refuse={"m2::model"})
++    ev = await run(cfg("fanout"), fake)
++    assert ev[-1]["declined"] == 1 and ev[-1]["answered"] == 3
++    refused = [e for e in ev if e["type"] == "member" and e["refused"]]
++    assert len(refused) == 1 and refused[0]["ref"] == "m2::model"
++    assert REFUSAL not in fake.for_ref("chair::c")[0][2]
++
++
++async def test_all_members_failing_is_an_error_and_the_chair_is_never_called():
++    fake = FakeLLM(fail={f"m{i}::model" for i in range(4)})
++    ev = await run(cfg("fanout"), fake)
++    assert ev[-1]["type"] == "error" and "No member produced a usable answer" in ev[-1]["message"]
++    assert not fake.for_ref("chair::c")
++
++
++async def test_debate_skips_round_two_when_fewer_than_two_members_survive():
++    fake = FakeLLM(fail={"m1::model", "m2::model", "m3::model"})
++    ev = await run(cfg("debate", rounds=2), fake)
++    assert len(fake.calls) == 4 + 1             # 4 first-round calls (3 failed) + chair, no revision round
++    assert ev[-1]["type"] == "done" and ev[-1]["answered"] == 1
++
++
++async def test_a_failed_revision_keeps_the_members_earlier_answer():
++    fake = FakeLLM(fail_on={("m1::model", 2)})  # m1 answers round 1, fails round 2
++    ev = await run(cfg("debate", rounds=2), fake)
++    assert ev[-1]["type"] == "done" and ev[-1]["answered"] == 4
++    assert "ANSWER[m1::model#1]" in fake.for_ref("chair::c")[0][2]
++
++
++async def test_a_refusing_chair_is_flagged_and_an_empty_chair_is_an_error():
++    ev = await run(cfg("fanout"), FakeLLM(chair_reply=REFUSAL))
++    chair = [e for e in ev if e["type"] == "chair"][0]
++    assert chair["refused"] is True
++    ev = await run(cfg("fanout"), FakeLLM(chair_reply="   "))
++    assert ev[-1]["type"] == "error" and "chair produced no answer" in ev[-1]["message"]
++
++
++# --------------------------------------------------------------------------- verify
++async def test_verify_with_an_existing_draft_reviews_it_blind_and_the_chair_issues_a_verdict():
++    fake = FakeLLM()
++    ev = await run(cfg("verify", draft="THE DRAFT TEXT"), fake)
++    assert len(fake.calls) == 4 + 1
++    review_user = fake.for_ref("m0::model")[0][2]
++    assert "THE DRAFT TEXT" in review_user and "Question:" in review_user
++    assert "SCORE: n/5" in fake.for_ref("m0::model")[0][1]
++    chair_sys, chair_user = fake.for_ref("chair::c")[0][1], fake.for_ref("chair::c")[0][2]
++    assert "Verdict: accepted as-is" in chair_sys and "THE DRAFT TEXT" in chair_user
++    assert ev[-1]["type"] == "done"
++
++
++async def test_verify_with_a_worker_drafts_first_then_reviews_it():
++    fake = FakeLLM(worker_ref="local::w", worker_reply="WORKER DRAFT")
++    ev = await run(cfg("verify", worker="local::w"), fake)
++    assert fake.calls[0][0] == "local::w"
++    draft = [e for e in ev if e["type"] == "draft"][0]
++    assert draft["text"] == "WORKER DRAFT" and draft["ok"]
++    assert "WORKER DRAFT" in fake.for_ref("m3::model")[0][2]
++    assert len(fake.calls) == 1 + 4 + 1 and ev[-1]["calls"] == 6
++
++
++async def test_verify_stops_when_the_worker_declines_or_there_is_no_draft_source():
++    fake = FakeLLM(worker_ref="local::w", worker_reply=REFUSAL)
++    ev = await run(cfg("verify", worker="local::w"), fake)
++    assert ev[-1]["type"] == "error" and "declined" in ev[-1]["message"]
++    assert len(fake.calls) == 1
++    ev = await run(cfg("verify"), FakeLLM())
++    assert ev[-1]["type"] == "error" and "worker model or an existing draft" in ev[-1]["message"]
++    ev = await run(cfg("verify", worker="local::w"), FakeLLM(fail={"local::w"}))
++    assert ev[-1]["type"] == "error" and "no draft" in ev[-1]["message"]
++
++
++# --------------------------------------------------------------------------- skills
++async def test_skill_text_goes_to_the_chair_by_default_and_to_everyone_when_asked():
++    fake = FakeLLM()
++    await run(cfg("fanout", skill_text="BE-BRIEF-RULES"), fake)
++    assert "BE-BRIEF-RULES" in fake.for_ref("chair::c")[0][1]
++    assert all("BE-BRIEF-RULES" not in c[1] for c in fake.calls if c[0] != "chair::c")
++    fake = FakeLLM()
++    await run(cfg("fanout", skill_text="BE-BRIEF-RULES", skill_scope="all"), fake)
++    assert all("BE-BRIEF-RULES" in c[1] for c in fake.calls)
++
++
++# --------------------------------------------------------------------------- guard rails
++@pytest.mark.parametrize("make,needle", [
++    (lambda: cn.CouncilConfig(members=members(2), chair="chair::c", mode="nope"), "Unknown council mode"),
++    (lambda: cn.CouncilConfig(members=[], chair="chair::c"), "1-8 members"),
++    (lambda: cn.CouncilConfig(members=members(2) * 5, chair="chair::c"), "1-8 members"),
++    (lambda: cn.CouncilConfig(members=members(2), chair=""), "Pick a chair"),
++])
++async def test_bad_configs_yield_an_error_event_and_make_no_calls(make, needle):
++    fake = FakeLLM()
++    ev = await run(make(), fake)
++    assert kinds(ev) == ["error"] and needle in ev[0]["message"] and not fake.calls
++
++
++# --------------------------------------------------------------------------- config_from_dict
++def _body(**over):
++    body = {"members": [{"ref": "a::m1", "persona": "researcher"}, {"endpoint_id": "b", "model": "m2:7b"}],
++            "chair": "c::big", "mode": "debate", "rounds": 2}
++    body.update(over)
++    return body
++
++
++def test_config_from_dict_happy_path():
++    c = cn.config_from_dict(_body(skill_scope="all", draft="d" * 30000), skill_text="SK")
++    assert [m.ref for m in c.members] == ["a::m1", "b::m2:7b"]
++    assert c.members[0].persona.name == "Researcher" and c.members[1].persona is None
++    assert c.chair == "c::big" and c.skill_scope == "all" and c.skill_text == "SK"
++    assert len(c.draft) == 20000                   # capped
++
++
++def test_config_from_dict_accepts_custom_personas_and_clamps_values():
++    body = _body(members=[{"ref": "a::m", "persona": {"name": "Pirate", "prompt": "Talk like a pirate."}, "temperature": 9},
++                          {"ref": "b::m", "temperature": "nope"}], rounds=50)
++    c = cn.config_from_dict(body)
++    assert c.members[0].persona.name == "Pirate" and c.members[0].temperature == 1.5
++    assert c.members[1].temperature == 0.8 and c.rounds == cn.MAX_ROUNDS
++
++
++def test_duplicate_members_get_distinct_display_names():
++    c = cn.config_from_dict(_body(members=[{"ref": "a::m"}, {"ref": "b::m"}, {"ref": "c::m"}]))
++    assert len({m.display for m in c.members}) == 3
++
++
++@pytest.mark.parametrize("override,needle", [
++    ({"members": []}, "non-empty list"),
++    ({"members": [{"ref": "a::m"}] * 9}, "at most 8"),
++    ({"members": ["str"]}, "must be an object"),
++    ({"members": [{"ref": "nocolons"}]}, "endpoint_id and a model"),
++    ({"members": [{"ref": "::m"}]}, "endpoint_id and a model"),
++    ({"members": [{"ref": "a::m", "persona": "wizard"}]}, "unknown persona"),
++    ({"chair": "nochair"}, "chair must be"),
++    ({"mode": "vote"}, "mode must be one of"),
++])
++def test_config_from_dict_rejects_bad_input(override, needle):
++    with pytest.raises(ValueError, match=needle):
++        cn.config_from_dict(_body(**override))
+diff --git a/tests/test_hub_provider_presets.py b/tests/test_hub_provider_presets.py
+new file mode 100644
+index 00000000..97214a3e
+--- /dev/null
++++ b/tests/test_hub_provider_presets.py
+@@ -0,0 +1,278 @@
++"""Provider onboarding: key-prefix guess, model-list parsing and discovery against mocked APIs."""
++import httpx
++import pytest
++
++from src.hub import provider_presets as pp
++
++KEY = "sk-or-v1-SECRETSECRETSECRET"
++
++
++def _client(handler):
++    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
++
++
++def _chat(mid, **kw):
++    return {"id": mid, "architecture": {"input_modalities": ["text"], "output_modalities": ["text"]}, **kw}
++
++
++# --------------------------------------------------------------------------- guess
++@pytest.mark.parametrize("key,expected", [
++    ("sk-or-v1-abc", ["openrouter"]),
++    ("sk-ant-api03-abc", ["anthropic"]),
++    ("AIzaSyAbc", ["google"]),
++    ("gsk_abc", ["groq"]),
++    ("xai-abc", ["xai"]),
++    ("nvapi-abc", ["nvidia"]),
++    ("hf_abc", ["huggingface"]),
++    ("csk-abc", ["cerebras"]),
++    ("sk-abc", ["openai", "deepseek"]),     # ambiguous on purpose
++    ("  sk-or-v1-abc  ", ["openrouter"]),   # whitespace from copy/paste
++    ("", []),
++    ("abcdef0123456789", []),               # e.g. Mistral/Together have no distinctive prefix
++])
++def test_guess_provider(key, expected):
++    assert pp.guess_provider(key) == expected
++
++
++def test_presets_are_well_formed():
++    ids = [p.id for p in pp.PRESETS]
++    assert len(ids) == len(set(ids))
++    for p in pp.PRESETS:
++        if p.id != "custom":
++            assert p.base_url.startswith(("https://", "http://localhost")), p.id
++        if p.local:
++            assert not p.needs_key
++    assert pp.get_preset("OpenRouter").id == "openrouter"
++    assert pp.get_preset("nope") is None
++    for item in pp.public_presets():  # presets are public data: prefixes only, never a stored key
++        assert "api_key" not in item
++        assert all(len(prefix) <= 8 for prefix in item["key_prefixes"])
++
++
++# --------------------------------------------------------------------------- parsers
++def test_parse_openrouter_flags_free_vision_tools_reasoning():
++    data = {"data": [
++        _chat("meta/llama:free", name="Llama", context_length=131072,
++              pricing={"prompt": "0", "completion": "0"}, supported_parameters=["tools"]),
++        {**_chat("openai/gpt-x", name="GPT X", context_length=400000, pricing={"prompt": "0.000001", "completion": "0.00001"},
++                 supported_parameters=["tools", "include_reasoning"]),
++         "architecture": {"input_modalities": ["text", "image"], "output_modalities": ["text"]}},
++        _chat("vendor/zero", pricing={"prompt": "0", "completion": "0"}),
++        _chat("vendor/half-free", pricing={"prompt": "0", "completion": "0.000002"}),
++        {"id": "vendor/no-pricing"},
++        {"id": "img/only", "architecture": {"output_modalities": ["image"]}},
++        "junk", {"name": "no id"},
++    ]}
++    cards = {c.id: c for c in pp.parse_openrouter(data)}
++    assert set(cards) == {"meta/llama:free", "openai/gpt-x", "vendor/zero", "vendor/half-free", "vendor/no-pricing"}
++    assert cards["meta/llama:free"].free is True and cards["meta/llama:free"].tools is True
++    assert cards["meta/llama:free"].context_length == 131072
++    assert cards["openai/gpt-x"].free is False and cards["openai/gpt-x"].vision is True
++    assert cards["openai/gpt-x"].reasoning is True
++    assert cards["vendor/zero"].free is True          # zero price without the :free suffix
++    assert cards["vendor/half-free"].free is False     # only one side is free
++    assert cards["vendor/no-pricing"].free is None     # unknown, not guessed
++
++
++def test_parse_google_keeps_only_generate_content_models():
++    data = {"models": [
++        {"name": "models/gemini-2.5-flash", "displayName": "Gemini 2.5 Flash", "inputTokenLimit": 1048576,
++         "supportedGenerationMethods": ["generateContent", "countTokens"]},
++        {"name": "models/text-embedding-004", "supportedGenerationMethods": ["embedContent"]},
++        {"name": "models/imagen-3", "supportedGenerationMethods": ["generateContent"]},   # name filter
++        {"baseModelId": "gemini-2.5-pro", "name": "models/gemini-2.5-pro-001", "supportedGenerationMethods": ["generateContent"]},
++        {"name": "models/no-methods"},
++    ]}
++    ids = [c.id for c in pp.parse_google(data)]
++    assert ids == ["gemini-2.5-flash", "gemini-2.5-pro"]
++
++
++def test_parse_openai_style_bare_list_dedupes_and_drops_non_chat():
++    data = [{"id": "llama-3"}, {"id": "llama-3"}, {"id": "text-embedding-3-small"}, {"id": "whisper-1"},
++            {"id": "rerank-x", "type": "rerank"}, {"id": "qwen", "context_length": 32768}, {"nope": 1}, 5]
++    cards = pp.parse_openai_style(data)
++    assert [c.id for c in cards] == ["llama-3", "qwen"]
++    assert cards[1].context_length == 32768
++
++
++def test_parse_openai_style_marks_local_cards():
++    assert pp.parse_openai_style({"data": [{"id": "qwen3:4b"}]}, local=True)[0].local is True
++
++
++# --------------------------------------------------------------------------- discovery
++async def test_openrouter_checks_key_then_lists_with_pagination():
++    seen = []
++
++    def handler(req: httpx.Request) -> httpx.Response:
++        seen.append(req.url.path)
++        assert req.headers["authorization"] == f"Bearer {KEY}"
++        if req.url.path.endswith("/key"):
++            return httpx.Response(200, json={"data": {"is_free_tier": True, "label": "sk-or-v1-abc...xyz"}})
++        if req.url.params.get("offset") == "1":
++            return httpx.Response(200, json={"data": [_chat("b/two:free", pricing={"prompt": "0", "completion": "0"})]})
++        return httpx.Response(200, json={"data": [_chat("a/one")], "links": {"next": "/api/v1/models?offset=1"}})
++
++    async with _client(handler) as c:
++        found = await pp.discover("openrouter", KEY, client=c)
++    assert [m.id for m in found.cards] == ["a/one", "b/two:free"]
++    assert found.key_info == {"is_free_tier": True, "label": "sk-or-v1-abc...xyz"}
++    assert seen[0].endswith("/key")  # key is validated before the big list is fetched
++
++
++async def test_openrouter_never_follows_pagination_to_another_host():
++    hosts = []
++
++    def handler(req):
++        hosts.append(req.url.host)
++        if req.url.path.endswith("/key"):
++            return httpx.Response(200, json={"data": {}})
++        return httpx.Response(200, json={"data": [_chat("a/one")], "links": {"next": "https://evil.example/steal"}})
++
++    async with _client(handler) as c:
++        found = await pp.discover("openrouter", KEY, client=c)
++    assert [m.id for m in found.cards] == ["a/one"]
++    assert set(hosts) == {"openrouter.ai"}
++
++
++async def test_openrouter_bad_key_fails_fast_and_never_echoes_the_key():
++    calls = []
++
++    def handler(req):
++        calls.append(req.url.path)
++        return httpx.Response(401, json={"error": {"message": f"bad {KEY}"}})
++
++    async with _client(handler) as c:
++        with pytest.raises(pp.DiscoveryError) as ei:
++            await pp.discover("openrouter", KEY, client=c)
++    assert ei.value.status == 401 and KEY not in ei.value.message and "rejected this key" in ei.value.message
++    assert len(calls) == 1  # did not go on to download the model list
++
++
++async def test_openrouter_key_check_outage_is_not_fatal():
++    def handler(req):
++        if req.url.path.endswith("/key"):
++            return httpx.Response(500)
++        return httpx.Response(200, json={"data": [_chat("a/one")]})
++
++    async with _client(handler) as c:
++        found = await pp.discover("openrouter", KEY, client=c)
++    assert found.key_info is None and len(found.cards) == 1
++
++
++async def test_google_uses_native_list_header_key_and_pages():
++    def handler(req):
++        assert req.headers["x-goog-api-key"] == "AIzaKEY"
++        assert req.url.path == "/v1beta/models"            # /openai suffix stripped for the catalog
++        if req.url.params.get("pageToken") == "t2":
++            return httpx.Response(200, json={"models": [
++                {"name": "models/gemini-2.5-pro", "supportedGenerationMethods": ["generateContent"]}]})
++        return httpx.Response(200, json={"models": [
++            {"name": "models/gemini-2.5-flash", "supportedGenerationMethods": ["generateContent"]}], "nextPageToken": "t2"})
++
++    async with _client(handler) as c:
++        found = await pp.discover("google", "AIzaKEY", client=c)
++    assert [m.id for m in found.cards] == ["gemini-2.5-flash", "gemini-2.5-pro"]
++
++
++async def test_anthropic_headers_and_pagination():
++    def handler(req):
++        assert req.headers["x-api-key"] == "sk-ant-KEY" and req.headers["anthropic-version"] == "2023-06-01"
++        assert req.url.path == "/v1/models"
++        if req.url.params.get("after_id") == "m1":
++            return httpx.Response(200, json={"data": [{"id": "m2", "display_name": "Two"}], "has_more": False})
++        return httpx.Response(200, json={"data": [{"id": "m1", "display_name": "One"}], "has_more": True, "last_id": "m1"})
++
++    async with _client(handler) as c:
++        found = await pp.discover("anthropic", "sk-ant-KEY", client=c)
++    assert [(m.id, m.name) for m in found.cards] == [("m1", "One"), ("m2", "Two")]
++
++
++async def test_openai_style_provider_uses_bearer_and_base_path():
++    def handler(req):
++        assert req.url.host == "api.groq.com" and req.url.path == "/openai/v1/models"
++        assert req.headers["authorization"] == "Bearer gsk_KEY"
++        return httpx.Response(200, json={"data": [{"id": "llama-3.3-70b-versatile"}, {"id": "whisper-large-v3"}]})
++
++    async with _client(handler) as c:
++        cards = await pp.discover_models("groq", "gsk_KEY", client=c)
++    assert [m.id for m in cards] == ["llama-3.3-70b-versatile"]
++
++
++async def test_local_provider_needs_no_key_and_sends_no_auth_header():
++    def handler(req):
++        assert "authorization" not in req.headers
++        assert req.url.port == 11434
++        return httpx.Response(200, json={"data": [{"id": "qwen3:4b"}]})
++
++    async with _client(handler) as c:
++        found = await pp.discover("ollama", "", client=c)
++    assert found.cards[0].local is True
++
++
++async def test_custom_provider_requires_a_valid_base_url():
++    async with _client(lambda r: httpx.Response(200, json={"data": [{"id": "m"}]})) as c:
++        with pytest.raises(pp.DiscoveryError, match="base URL is required"):
++            await pp.discover("custom", "", "", client=c)
++        with pytest.raises(pp.DiscoveryError, match="http"):
++            await pp.discover("custom", "", "ftp://x", client=c)
++        ok = await pp.discover("custom", "", "http://my-box:8000/v1", client=c)
++    assert ok.cards[0].id == "m"
++
++
++@pytest.mark.parametrize("provider,key,msg", [
++    ("nope", "k", "Unknown provider"),
++    ("openai", "", "Paste your OpenAI API key"),
++])
++async def test_input_errors(provider, key, msg):
++    with pytest.raises(pp.DiscoveryError, match=msg):
++        await pp.discover(provider, key)
++
++
++@pytest.mark.parametrize("status,needle", [(401, "rejected this key"), (403, "firewall/proxy"),
++                                           (404, "no model list"), (429, "rate-limiting"), (500, "HTTP 500")])
++async def test_http_errors_are_friendly_and_never_leak_the_key(status, needle):
++    key = "sk-LEAKTEST-123456"
++    async with _client(lambda r: httpx.Response(status, text=f"oops {key}")) as c:
++        with pytest.raises(pp.DiscoveryError) as ei:
++            await pp.discover("openai", key, client=c)
++    assert needle in ei.value.message and key not in ei.value.message and ei.value.status == status
++
++
++async def test_network_failures_and_garbage_bodies():
++    def boom(req):
++        raise httpx.ConnectError("refused", request=req)
++
++    def slow(req):
++        raise httpx.ReadTimeout("slow", request=req)
++
++    async with _client(boom) as c:
++        with pytest.raises(pp.DiscoveryError, match="Could not reach"):
++            await pp.discover("openai", "sk-x", client=c)
++    async with _client(slow) as c:
++        with pytest.raises(pp.DiscoveryError, match="Timed out"):
++            await pp.discover("openai", "sk-x", client=c)
++    async with _client(lambda r: httpx.Response(200, text="<html>not json</html>")) as c:
++        with pytest.raises(pp.DiscoveryError, match="not JSON"):
++            await pp.discover("openai", "sk-x", client=c)
++    async with _client(lambda r: httpx.Response(200, json={"data": []})) as c:
++        with pytest.raises(pp.DiscoveryError, match="no chat models"):
++            await pp.discover("openai", "sk-x", client=c)
++
++
++async def test_redirects_are_not_followed():
++    hits = []
++
++    def handler(req):
++        hits.append(str(req.url))
++        return httpx.Response(302, headers={"location": "http://169.254.169.254/latest/meta-data"})
++
++    # owns its client -> the module builds one with follow_redirects=False
++    import httpx as _h
++    orig = _h.AsyncClient
++    try:
++        _h.AsyncClient = lambda **kw: orig(transport=_h.MockTransport(handler), **kw)
++        with pytest.raises(pp.DiscoveryError):
++            await pp.discover("openai", "sk-x")
++    finally:
++        _h.AsyncClient = orig
++    assert len(hits) == 1 and "169.254" not in hits[0]
+diff --git a/tests/test_hub_routes.py b/tests/test_hub_routes.py
+new file mode 100644
+index 00000000..4ff1f4fd
+--- /dev/null
++++ b/tests/test_hub_routes.py
+@@ -0,0 +1,390 @@
++"""HTTP layer for provider onboarding, the Auto pool/router and the council runner (all collaborators mocked)."""
++import json
++
++import pytest
++from fastapi import FastAPI, HTTPException
++from fastapi.testclient import TestClient
++
++import routes.hub_auto_routes as auto_routes
++import routes.hub_provider_routes as provider_routes
++from src.hub import provider_presets as pp
++
++
++# --------------------------------------------------------------------------- provider routes
++@pytest.fixture
++def prov(monkeypatch):
++    state = {"calls": [], "result": None, "error": None, "admin": True}
++
++    def fake_admin(request):
++        if not state["admin"]:
++            raise HTTPException(403, "Admin only")
++
++    async def fake_discover(preset_id, api_key="", base_url="", **kw):
++        state["calls"].append((preset_id, api_key, base_url))
++        if state["error"]:
++            raise state["error"]
++        return state["result"]
++
++    monkeypatch.setattr(provider_routes, "require_admin", fake_admin)
++    monkeypatch.setattr(pp, "discover", fake_discover)
++    state["result"] = pp.Discovery(
++        cards=[pp.ModelCard("a/free:free", free=True), pp.ModelCard("b/paid", free=False), pp.ModelCard("c/unknown")],
++        key_info={"is_free_tier": True, "label": "sk-or-v1-abc...xyz"})
++    app = FastAPI()
++    app.include_router(provider_routes.setup_provider_routes())
++    return state, TestClient(app)
++
++
++def test_presets_and_guess(prov):
++    _state, c = prov
++    presets = c.get("/api/providers/presets").json()["presets"]
++    assert {"openrouter", "google", "ollama", "custom"} <= {p["id"] for p in presets}
++    assert c.post("/api/providers/guess", json={"api_key": "sk-or-v1-x"}).json() == {"candidates": ["openrouter"]}
++    assert c.post("/api/providers/guess", json={"api_key": ""}).json() == {"candidates": []}
++
++
++def test_models_returns_cards_counts_and_key_info(prov):
++    state, c = prov
++    r = c.post("/api/providers/models", json={"provider": "openrouter", "api_key": "sk-or-v1-x"})
++    body = r.json()
++    assert r.status_code == 200 and body["count"] == 3 and body["free_count"] == 1
++    assert body["key_info"]["is_free_tier"] is True and body["models"][0]["id"] == "a/free:free"
++    assert state["calls"] == [("openrouter", "sk-or-v1-x", "https://openrouter.ai/api/v1")]
++    assert "sk-or-v1-x" not in r.text            # the key is never echoed back
++
++
++def test_a_cloud_provider_address_cannot_be_overridden(prov):
++    state, c = prov
++    r = c.post("/api/providers/models", json={"provider": "openai", "api_key": "sk-x", "base_url": "https://evil.example/v1"})
++    assert r.status_code == 400 and "fixed" in r.json()["detail"] and not state["calls"]
++
++
++def test_custom_provider_uses_the_typed_address(prov):
++    state, c = prov
++    r = c.post("/api/providers/models", json={"provider": "custom", "base_url": "http://box:8000/v1"})
++    assert r.status_code == 200 and state["calls"] == [("custom", "", "http://box:8000/v1")]
++
++
++def test_local_provider_goes_through_the_docker_loopback_rewrite(prov, monkeypatch):
++    import routes.model_routes as model_routes
++    monkeypatch.setattr(model_routes, "_rewrite_loopback_for_docker", lambda url, **kw: url.replace("localhost", "host.docker.internal"))
++    state, c = prov
++    assert c.post("/api/providers/models", json={"provider": "ollama"}).status_code == 200
++    assert state["calls"][0][2] == "http://host.docker.internal:11434/v1"
++
++
++@pytest.mark.parametrize("err,status", [
++    (pp.DiscoveryError("OpenRouter rejected this key (HTTP 401).", 401), 400),   # never relay 401/403 to the browser
++    (pp.DiscoveryError("rejected (HTTP 403).", 403), 400),
++    (pp.DiscoveryError("no model list (HTTP 404).", 404), 400),
++    (pp.DiscoveryError("rate-limiting (HTTP 429).", 429), 429),
++    (pp.DiscoveryError("Could not reach api.x.com: ConnectError."), 502),
++    (pp.DiscoveryError("Timed out reaching api.x.com."), 502),
++    (pp.DiscoveryError("Paste your OpenAI API key first."), 400),
++    (pp.DiscoveryError("Unknown provider 'zzz'."), 400),
++    (pp.DiscoveryError("The base URL must start with http:// or https://"), 400),
++])
++def test_discovery_errors_map_to_safe_status_codes(prov, err, status):
++    state, c = prov
++    state["error"] = err
++    r = c.post("/api/providers/models", json={"provider": "openai", "api_key": "sk-x"})
++    assert r.status_code == status and r.json()["detail"] == err.message
++
++
++def test_unknown_provider_and_non_admin(prov):
++    state, c = prov
++    assert c.post("/api/providers/models", json={"provider": "nope"}).status_code == 400
++    state["admin"] = False
++    for method, path, body in [("get", "/api/providers/presets", None), ("post", "/api/providers/guess", {"api_key": "x"}),
++                               ("post", "/api/providers/models", {"provider": "openai", "api_key": "k"})]:
++        r = getattr(c, method)(path, **({"json": body} if body else {}))
++        assert r.status_code == 403
++
++
++# --------------------------------------------------------------------------- auto / council routes
++class FakeSkills:
++    def read_skill_md(self, name, owner=None):
++        return "---\nname: caveman-be-brief\ndescription: be brief\n---\nBE-BRIEF-BODY\nsecond line" if name == "caveman-be-brief" else None
++
++
++@pytest.fixture
++def env(monkeypatch):
++    state = {
++        "prefs": {},
++        "index": {"or": {"name": "OpenRouter", "local": False}, "loc": {"name": "Ollama", "local": True}},
++        "llm": [], "replies": {},
++    }
++
++    class Prefs:
++        @staticmethod
++        def _load_for_user(user):
++            return json.loads(json.dumps(state["prefs"]))
++
++        @staticmethod
++        def _save_for_user(user, prefs):
++            state["prefs"] = json.loads(json.dumps(prefs))
++
++    def fake_resolve(ep_id, model, owner=None, require_exact_model=False):
++        return (f"http://{ep_id}.test/v1/chat/completions", model, {"X": "1"}) if ep_id in state["index"] and model else None
++
++    async def fake_llm(url, model, messages, **kw):
++        state["llm"].append({"url": url, "model": model, "messages": messages, **kw})
++        reply = state["replies"].get(model, f"reply from {model}")
++        if isinstance(reply, Exception):
++            raise reply
++        return reply
++
++    monkeypatch.setattr(auto_routes, "_prefs", lambda: Prefs)
++    monkeypatch.setattr(auto_routes, "_endpoint_index", lambda owner: state["index"])
++    monkeypatch.setattr(auto_routes, "require_api_token_scope", lambda request, scope: "tester")
++    monkeypatch.setattr(auto_routes, "resolve_endpoint_by_id", fake_resolve)
++    monkeypatch.setattr(auto_routes, "llm_call_async", fake_llm)
++    app = FastAPI()
++    app.include_router(auto_routes.setup_auto_routes(skills_manager=FakeSkills()))
++    return state, TestClient(app)
++
++
++POOL = [
++    {"endpoint_id": "or", "model": "meta/llama:free", "label": "Llama Free", "tags": ["General", " code "], "free": True, "context_length": 131072},
++    {"endpoint_id": "or", "model": "qwen/coder:free", "label": "Qwen Coder", "free": True, "vision": False},
++    {"endpoint_id": "loc", "model": "qwen3:4b", "label": "Qwen3 4B local", "context_length": 8192},
++]
++
++
++def save_pool(c, pool=None, **settings):
++    return c.put("/api/auto/pool", json={"pool": POOL if pool is None else pool, "settings": settings})
++
++
++def sse(resp):
++    events, done = [], False
++    for line in resp.text.splitlines():
++        if line.startswith("data: "):
++            payload = line[6:]
++            if payload == "[DONE]":
++                done = True
++            else:
++                events.append(json.loads(payload))
++    return events, done
++
++
++# ---- pool storage ---------------------------------------------------------------------------------
++def test_pool_round_trip_cleans_input_and_recomputes_local_server_side(env):
++    state, c = env
++    dirty = POOL + [
++        {"endpoint_id": "ghost", "model": "x"},                     # endpoint doesn't exist
++        {"endpoint_id": "or", "model": "meta/llama:free"},          # duplicate
++        {"endpoint_id": "", "model": "x"}, {"endpoint_id": "a::b", "model": "m"},
++    ]
++    dirty[0] = {**dirty[0], "local": True}                           # a cloud model claiming to be local
++    r = save_pool(c, dirty, router_ref="loc::qwen3:4b", default_ref="ghost::m", keep_local_default=1)
++    assert r.status_code == 200 and r.json()["saved"] == 3 and r.json()["dropped"] == 4
++    assert r.json()["settings"]["router_ref"] == "loc::qwen3:4b"
++    assert r.json()["settings"]["default_ref"] == ""                 # points at an unknown endpoint -> cleared
++    got = c.get("/api/auto/pool").json()
++    by_model = {e["model"]: e for e in got["pool"]}
++    assert by_model["meta/llama:free"]["local"] is False             # server truth, not the client's claim
++    assert by_model["qwen3:4b"]["local"] is True
++    assert by_model["meta/llama:free"]["tags"] == ["general", "code"]
++    assert got["settings"]["keep_local_default"] is True
++    assert {e["id"] for e in got["endpoints"]} == {"or", "loc"}
++
++
++def test_malformed_pool_bodies_are_rejected_outright(env):
++    _state, c = env
++    assert c.put("/api/auto/pool", json={"pool": ["junk"], "settings": {}}).status_code == 422
++    assert c.put("/api/auto/pool", json={"pool": [POOL[0]] * (auto_routes.MAX_POOL + 1), "settings": {}}).status_code == 422
++
++
++def test_removed_endpoints_show_as_unavailable_and_are_not_routed(env):
++    state, c = env
++    save_pool(c)
++    del state["index"]["loc"]
++    pool = c.get("/api/auto/pool").json()["pool"]
++    assert [e["available"] for e in pool] == [True, True, False]
++    r = c.post("/api/auto/route", json={"message": "hi"})
++    assert r.status_code == 200 and r.json()["endpoint_id"] == "or"
++
++
++# ---- routing --------------------------------------------------------------------------------------
++def test_route_uses_the_router_model_and_returns_a_decision(env):
++    state, c = env
++    save_pool(c, router_ref="or::meta/llama:free")
++    state["replies"]["meta/llama:free"] = '{"pick": 2, "reason": "code task"}'
++    r = c.post("/api/auto/route", json={"message": "write a python function"})
++    body = r.json()
++    assert r.status_code == 200 and body["model"] == "qwen/coder:free" and body["source"] == "router" and body["reason"] == "code task"
++    call = state["llm"][0]
++    assert call["model"] == "meta/llama:free" and call["timeout"] == 15 and call["max_retries"] == 1
++    assert call["temperature"] == 0.0 and "write a python function" in call["messages"][1]["content"]
++
++
++def test_route_without_a_router_uses_pool_order_and_never_calls_a_model(env):
++    state, c = env
++    save_pool(c)
++    body = c.post("/api/auto/route", json={"message": "hi"}).json()
++    assert body["source"] == "fallback" and body["model"] == "meta/llama:free" and not state["llm"]
++
++
++def test_router_failure_degrades_to_the_default_model(env):
++    state, c = env
++    save_pool(c, router_ref="or::meta/llama:free", default_ref="or::qwen/coder:free")
++    state["replies"]["meta/llama:free"] = RuntimeError("429")
++    body = c.post("/api/auto/route", json={"message": "hi"}).json()
++    assert body["source"] == "fallback" and body["model"] == "qwen/coder:free"
++    assert any("router unavailable" in n for n in body["notes"])
++
++
++def test_keep_local_never_sends_the_message_to_a_cloud_router(env):
++    state, c = env
++    save_pool(c, router_ref="or::meta/llama:free")                   # a CLOUD router
++    r = c.post("/api/auto/route", json={"message": "my private notes", "keep_local": True})
++    body = r.json()
++    assert r.status_code == 200 and body["model"] == "qwen3:4b" and body["local"] is True
++    assert any("router skipped" in n for n in body["notes"])
++    assert state["llm"] == []                                        # nothing left the machine
++
++
++def test_keep_local_may_use_a_local_router_and_only_sees_local_candidates(env):
++    state, c = env
++    pool = POOL + [{"endpoint_id": "loc", "model": "phi4-mini", "label": "Phi4 Mini"}]
++    save_pool(c, pool, router_ref="loc::qwen3:4b")
++    state["replies"]["qwen3:4b"] = '{"pick": 2, "reason": "tiny task"}'
++    body = c.post("/api/auto/route", json={"message": "summarise this", "keep_local": True}).json()
++    assert body["model"] == "phi4-mini" and body["source"] == "router"
++    prompt = state["llm"][0]["messages"][1]["content"]
++    assert "Llama Free" not in prompt and "Qwen Coder" not in prompt
++    assert state["llm"][0]["url"].startswith("http://loc.test")
++
++
++def test_saved_keep_local_default_applies_unless_the_request_overrides_it(env):
++    state, c = env
++    save_pool(c, keep_local_default=True)
++    assert c.post("/api/auto/route", json={"message": "hi"}).json()["local"] is True
++    assert c.post("/api/auto/route", json={"message": "hi", "keep_local": False}).json()["local"] is False
++
++
++def test_keep_local_without_any_local_model_is_a_409_not_a_silent_cloud_fallback(env):
++    state, c = env
++    save_pool(c, [p for p in POOL if p["endpoint_id"] == "or"])
++    r = c.post("/api/auto/route", json={"message": "hi", "keep_local": True})
++    assert r.status_code == 409 and "no offline model" in r.json()["detail"]
++
++
++def test_exclude_supports_a_try_another_model_button(env):
++    state, c = env
++    save_pool(c)
++    first = c.post("/api/auto/route", json={"message": "hi"}).json()
++    tried = [f"{first['endpoint_id']}::{first['model']}"]
++    second = c.post("/api/auto/route", json={"message": "hi", "exclude": tried}).json()
++    assert second["model"] != first["model"]
++    allrefs = tried + [r for r in second["candidates"]]
++    r = c.post("/api/auto/route", json={"message": "hi", "exclude": allrefs})
++    assert r.status_code == 409 and "No other model" in r.json()["detail"]
++
++
++def test_empty_pool_is_a_409(env):
++    _state, c = env
++    assert c.post("/api/auto/route", json={"message": "hi"}).status_code == 409
++
++
++# ---- council --------------------------------------------------------------------------------------
++def members():
++    return [{"ref": "or::meta/llama:free", "persona": "researcher"}, {"ref": "or::qwen/coder:free", "persona": "logician"},
++            {"ref": "loc::qwen3:4b", "persona": "contrarian"}]
++
++
++def test_council_plan(env):
++    _state, c = env
++    assert c.post("/api/council/plan", json={"mode": "debate", "members": 4, "rounds": 2}).json()["calls"] == 9
++    assert c.post("/api/council/plan", json={"mode": "vote"}).status_code == 400
++    assert c.post("/api/council/plan", json={"members": 99}).status_code == 422
++
++
++def test_council_run_streams_events_and_calls_every_model(env):
++    state, c = env
++    r = c.post("/api/council/run", json={"question": "Is 7 prime?", "members": members(), "chair": "or::meta/llama:free", "mode": "debate", "rounds": 2})
++    events, done = sse(r)
++    assert r.status_code == 200 and r.headers["content-type"].startswith("text/event-stream") and done
++    kinds = [e["type"] for e in events]
++    assert kinds[0] == "start" and kinds[-1] == "done" and "chair" in kinds and kinds.count("member") == 6
++    assert len(state["llm"]) == 7                                    # 3 members x 2 rounds + chair
++    assert all(call["workload"] == "foreground" and call["max_retries"] == 2 for call in state["llm"])
++    assert events[-1]["calls"] == 7 and events[-1]["answered"] == 3
++
++
++def test_council_run_injects_a_skill_without_its_frontmatter(env):
++    state, c = env
++    r = c.post("/api/council/run", json={"question": "Q", "members": members()[:2], "chair": "or::meta/llama:free",
++                                         "mode": "fanout", "skill": "caveman-be-brief"})
++    assert r.status_code == 200
++    chair_call = state["llm"][-1]
++    system = chair_call["messages"][0]["content"]
++    assert "BE-BRIEF-BODY" in system and "description: be brief" not in system and "name: caveman" not in system
++    assert all("BE-BRIEF-BODY" not in call["messages"][0]["content"] for call in state["llm"][:-1])   # chair-only by default
++
++
++def test_council_verify_mode_with_a_local_worker(env):
++    state, c = env
++    state["replies"]["qwen3:4b"] = "LOCAL DRAFT"
++    r = c.post("/api/council/run", json={"question": "Q", "members": members()[:2], "chair": "or::meta/llama:free",
++                                         "mode": "verify", "worker": "loc::qwen3:4b"})
++    events, _ = sse(r)
++    assert state["llm"][0]["model"] == "qwen3:4b" and [e for e in events if e["type"] == "draft"][0]["text"] == "LOCAL DRAFT"
++    assert "LOCAL DRAFT" in state["llm"][1]["messages"][1]["content"]       # reviewers get the draft
++
++
++def test_council_keep_local_rejects_any_cloud_model_before_a_single_call(env):
++    state, c = env
++    r = c.post("/api/council/run", json={"question": "Q", "members": members(), "chair": "loc::qwen3:4b", "keep_local": True})
++    assert r.status_code == 409 and "cloud model" in r.json()["detail"] and state["llm"] == []
++    local_only = [{"ref": "loc::qwen3:4b", "persona": "researcher"}, {"ref": "loc::phi4-mini", "persona": "logician"}]
++    r = c.post("/api/council/run", json={"question": "Q", "members": local_only, "chair": "loc::qwen3:4b", "keep_local": True, "mode": "fanout"})
++    assert r.status_code == 200 and all(call["url"].startswith("http://loc.test") for call in state["llm"])
++
++
++@pytest.mark.parametrize("body,status,needle", [
++    ({"members": [{"ref": "ghost::m"}], "chair": "or::m"}, 400, "Model not available"),
++    ({"members": [{"ref": "or::m"}], "chair": "ghost::m"}, 400, "Model not available"),
++    ({"members": [{"ref": "or::m", "persona": "wizard"}], "chair": "or::m"}, 400, "unknown persona"),
++    ({"members": [{"ref": "or::m"}], "chair": "or::m", "mode": "vote"}, 400, "mode must be"),
++    ({"members": [{"ref": "or::m"}], "chair": "or::m", "skill": "no-such-skill"}, 404, "not found"),
++    ({"members": [{"ref": "or::m"}], "chair": "or::m", "worker": "ghost::w", "mode": "verify"}, 400, "Model not available"),
++])
++def test_council_run_validates_before_streaming(env, body, status, needle):
++    state, c = env
++    r = c.post("/api/council/run", json={"question": "Q", **body})
++    assert r.status_code == status and needle in r.json()["detail"] and state["llm"] == []
++
++
++def test_a_member_failing_mid_run_is_reported_not_fatal(env):
++    state, c = env
++    state["replies"]["qwen/coder:free"] = RuntimeError("503")
++    events, done = sse(c.post("/api/council/run", json={"question": "Q", "members": members(), "chair": "or::meta/llama:free", "mode": "fanout"}))
++    assert done and events[-1]["type"] == "done" and events[-1]["failed"] == 1
++
++
++def test_an_unexpected_crash_ends_the_stream_cleanly(env, monkeypatch):
++    state, c = env
++
++    async def boom(*a, **k):
++        raise ValueError("kaboom")
++        yield  # pragma: no cover
++
++    monkeypatch.setattr(auto_routes.cn, "run_council", boom)
++    events, done = sse(c.post("/api/council/run", json={"question": "Q", "members": members()[:1], "chair": "or::meta/llama:free"}))
++    assert done and events[-1] == {"type": "error", "message": "The council failed unexpectedly."}   # no stack trace leaks
++
++
++def test_the_combined_hub_router_registers_every_endpoint():
++    # FastAPI expands included routers lazily, so read the generated OpenAPI schema instead of router.routes.
++    from routes.hub_routes import setup_hub_routes
++    app = FastAPI()
++    app.include_router(setup_hub_routes(skills_manager=None))
++    schema = app.openapi()["paths"]
++    got = {(m.upper(), path) for path, ops in schema.items() for m in ops}
++    expected = {
++        ("GET", "/api/providers/presets"), ("POST", "/api/providers/guess"), ("POST", "/api/providers/models"),
++        ("GET", "/api/auto/pool"), ("PUT", "/api/auto/pool"), ("POST", "/api/auto/route"),
++        ("POST", "/api/council/plan"), ("POST", "/api/council/run"),
++    }
++    assert expected <= got, expected - got
+-- 
+2.43.0
+
+
+From c056dcca1d9f704a80879ba8982158c782e9f0fe Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 5 Oct 2026 10:35:25 +0000
+Subject: [PATCH 2/2] feat(hub): UI for providers, Auto pool and council
+
+static/js/hub/hub.js adds one modal (Connect, Auto pool, Council) opened from the model
+picker, and window.odysseusAuto.beforeSend for chat.js.
+
+Existing files touched: one <script> tag in index.html and a 3-line hook in
+handleChatSubmit (chat.js). No service-worker change: JS is network-first there.
+---
+ static/index.html    |   1 +
+ static/js/chat.js    |   3 +
+ static/js/hub/hub.js | 631 +++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 635 insertions(+)
+ create mode 100644 static/js/hub/hub.js
+
+diff --git a/static/index.html b/static/index.html
+index 3693ffab..e177f426 100644
+--- a/static/index.html
++++ b/static/index.html
+@@ -2560,6 +2560,7 @@
+ <script type="module" src="/static/js/sessions.js"></script>
+ <script type="module" src="/static/js/memory.js?v=20260722memoryloading1"></script>
+ <script type="module" src="/static/js/skills.js"></script>
++<script type="module" src="/static/js/hub/hub.js"></script>
+ <script type="module" src="/static/js/tourHints.js"></script>
+ <script type="module" src="/static/js/tourAutoplay.js"></script>
+ <script type="module" src="/static/js/fileHandler.js"></script>
+diff --git a/static/js/chat.js b/static/js/chat.js
+index a5c95e43..668b18fa 100644
+--- a/static/js/chat.js
++++ b/static/js/chat.js
+@@ -1359,6 +1359,9 @@ import { loadPanel } from './panels.js';
+       }
+     })();
+ 
++    // Auto mode (static/js/hub/hub.js): may swap the model for this send, or block it under keep-local.
++    if (window.odysseusAuto && await window.odysseusAuto.beforeSend(msg, selectedRouteForSend, !!approvalForSend)) { _releaseSendFlag(); return; }
++
+     // Materialize pending session (deferred from model click) on first message
+     if (sessionModule.hasPendingChat && sessionModule.hasPendingChat()) {
+       _sendPerf.mark('pending_session_begin');
+diff --git a/static/js/hub/hub.js b/static/js/hub/hub.js
+new file mode 100644
+index 00000000..ed3bcdd1
+--- /dev/null
++++ b/static/js/hub/hub.js
+@@ -0,0 +1,631 @@
++// static/js/hub/hub.js
++// Providers · Auto pool · Council, in one modal with three tabs.
++//
++//   Connect  pick a provider, paste a key, the model list is fetched, tick the ones you want.
++//            Saving goes through the EXISTING POST /api/model-endpoints (key encryption and the model
++//            picker are unchanged) and, optionally, adds the models to the Auto pool.
++//   Auto     the saved pool + the router model. Exposes window.odysseusAuto for chat.js.
++//   Council  several models (or several personas of one model) work a question and a chair merges.
++//
++// Everything is built with createElement/textContent, never innerHTML, so model names, provider
++// messages and model output cannot inject markup. Pure helpers are exported for tests.
++
++// --------------------------------------------------------------------------- pure helpers
++export function h(tag, attrs = {}, ...kids) {
++  const node = document.createElement(tag);
++  for (const [k, v] of Object.entries(attrs || {})) {
++    if (v === false || v == null) continue;
++    if (k === 'class') node.className = v;
++    else if (k === 'dataset') Object.assign(node.dataset, v);
++    else if (k.startsWith('on') && typeof v === 'function') node.addEventListener(k.slice(2), v);
++    else if (k === 'value') node.value = v;
++    else if (k === 'checked') node.checked = !!v;
++    else if (k === 'disabled') node.disabled = !!v;
++    else node.setAttribute(k, v === true ? '' : String(v));
++  }
++  for (const kid of kids.flat()) {
++    if (kid == null || kid === false) continue;
++    node.append(kid.nodeType ? kid : document.createTextNode(String(kid)));
++  }
++  return node;
++}
++
++export function formatCtx(n) {
++  if (!n || n <= 0) return '';
++  if (n >= 1e6) return `${+(n / 1e6).toFixed(1)}M ctx`;
++  if (n >= 1000) return `${Math.round(n / 1000)}k ctx`;
++  return `${n} ctx`;
++}
++
++export function filterModels(models, { query = '', freeOnly = false } = {}) {
++  const q = String(query || '').trim().toLowerCase();
++  return (models || []).filter((m) => (!freeOnly || m.free === true) && (!q || `${m.id} ${m.name || ''}`.toLowerCase().includes(q)));
++}
++
++export function toPoolEntries(endpointId, models, selectedIds) {
++  const want = new Set(selectedIds);
++  return (models || []).filter((m) => want.has(m.id)).map((m) => ({
++    endpoint_id: endpointId, model: m.id, label: m.name || m.id, tags: [],
++    free: m.free ?? null, context_length: m.context_length ?? null, vision: m.vision ?? null, tools: m.tools ?? null,
++  }));
++}
++
++export function mergePool(existing, additions, max = 60) {
++  const base = Array.isArray(existing) ? existing : [];
++  const seen = new Set(base.map((e) => `${e.endpoint_id}::${e.model}`));
++  const pool = [...base];
++  let skipped = 0;
++  for (const a of additions || []) {
++    const key = `${a.endpoint_id}::${a.model}`;
++    if (seen.has(key)) continue;
++    if (pool.length >= max) { skipped += 1; continue; }
++    seen.add(key);
++    pool.push(a);
++  }
++  return { pool, added: pool.length - base.length, skipped };
++}
++
++export const refOf = (e) => `${e.endpoint_id}::${e.model}`;
++
++// Incremental parser for text/event-stream. Returns the parsed events and the unfinished remainder.
++export function parseSseChunk(buffer, chunk) {
++  const parts = (buffer + chunk).split('\n\n');
++  const rest = parts.pop();
++  const events = [];
++  for (const part of parts) {
++    for (const line of part.split('\n')) {
++      if (!line.startsWith('data:')) continue;
++      const payload = line.slice(5).trim();
++      if (!payload) continue;
++      if (payload === '[DONE]') { events.push({ type: '__done__' }); continue; }
++      try { events.push(JSON.parse(payload)); } catch (_) { /* ignore a malformed frame */ }
++    }
++  }
++  return { events, rest };
++}
++
++// --------------------------------------------------------------------------- api
++async function api(path, { method = 'GET', json, form } = {}) {
++  const init = { method, credentials: 'same-origin', headers: {} };
++  if (json !== undefined) { init.headers['Content-Type'] = 'application/json'; init.body = JSON.stringify(json); }
++  if (form) init.body = form;
++  const res = await fetch(path, init);
++  let data = null;
++  try { data = await res.json(); } catch (_) { /* not JSON */ }
++  if (!res.ok) {
++    const detail = data && (data.detail || data.error || data.message);
++    const err = new Error(typeof detail === 'string' ? detail : `Request failed (HTTP ${res.status})`);
++    err.status = res.status;
++    throw err;
++  }
++  return data;
++}
++
++function notify(msg) {
++  try { if (window.showToast) window.showToast(msg); } catch (_) { /* toast is optional */ }
++}
++
++// --------------------------------------------------------------------------- Auto state (used by chat.js)
++const LS = { enabled: 'odysseus.auto.enabled', keepLocal: 'odysseus.auto.keepLocal' };
++const lsGet = (k) => { try { return localStorage.getItem(k) === '1'; } catch (_) { return false; } };
++const lsSet = (k, v) => { try { localStorage.setItem(k, v ? '1' : '0'); } catch (_) { /* private mode */ } };
++
++export const auto = {
++  enabled: () => lsGet(LS.enabled),
++  keepLocal: () => lsGet(LS.keepLocal),
++  setEnabled: (v) => lsSet(LS.enabled, v),
++  setKeepLocal: (v) => lsSet(LS.keepLocal, v),
++  last: null,
++  // Called by chat.js before each send. Returns true when the send must be blocked (it has already told the
++  // user why). Otherwise it may change `route` in place to the model the router picked.
++  async beforeSend(message, route, isApproval = false) {
++    if (isApproval || !route || !auto.enabled()) return false;
++    const r = await auto.pick(message);
++    if (r.blocked) { if (window.showToast) window.showToast(r.message); else alert(r.message); return true; }
++    if (r.route) Object.assign(route, r.route, { source: 'auto' });
++    return false;
++  },
++  // Never throws. Returns { route } to use for this send, { blocked, message } to stop it, or {} to carry on
++  // with the model the user picked. With keep-local on, a failure BLOCKS the send instead of falling through.
++  async pick(message) {
++    try {
++      const d = await api('/api/auto/route', { method: 'POST', json: { message: String(message || '').slice(0, 20000), keep_local: auto.keepLocal() } });
++      auto.last = d;
++      window.dispatchEvent(new CustomEvent('odysseus:auto-picked', { detail: d }));
++      notify(`Auto → ${d.label}${d.reason ? ` · ${d.reason}` : ''}`);
++      return { route: { model: d.model, endpoint_id: d.endpoint_id, endpoint_url: '' } };
++    } catch (err) {
++      if (auto.keepLocal()) return { blocked: true, message: `Keep-local is on, so this message was not sent. ${err.message}` };
++      notify(`Auto could not pick a model (${err.message}). Using the selected model.`);
++      return {};
++    }
++  },
++};
++
++// shared pool store
++const poolStore = {
++  data: null,
++  async load() { this.data = await api('/api/auto/pool'); return this.data; },
++  async save(pool, settings) { const r = await api('/api/auto/pool', { method: 'PUT', json: { pool, settings } }); await this.load(); return r; },
++};
++const labelFor = (e) => `${e.label || e.model}  [${e.local ? 'offline' : 'cloud'}${e.free ? ', free' : ''}]`;
++
++// --------------------------------------------------------------------------- styles
++function injectCss() {
++  if (document.getElementById('odysseus-hub-css')) return;
++  const css = `
++.hub-content{width:min(860px,94vw);max-height:88vh;display:flex;flex-direction:column;color:var(--fg)}
++.hub-content .hidden{display:none !important}
++.hub-tabs{display:flex;gap:4px;padding:0 14px;border-bottom:1px solid var(--border)}
++.hub-tab{background:none;border:0;border-bottom:2px solid transparent;color:var(--fg-muted);padding:8px 12px;cursor:pointer;font:inherit}
++.hub-tab.active{color:var(--fg);border-bottom-color:var(--accent)}
++.hub-body{overflow:auto;padding:14px 16px;flex:1}
++.hub-row{display:flex;flex-direction:column;gap:4px;margin-bottom:10px}
++.hub-row>label,.hub-label{font-size:.85em;color:var(--fg-muted)}
++.hub-inline{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
++.hub-input{width:100%;box-sizing:border-box;padding:7px 9px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--fg);font:inherit}
++select.hub-input{width:auto;min-width:160px;max-width:100%}
++textarea.hub-input{min-height:84px;resize:vertical}
++.hub-btn{padding:7px 12px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--fg);cursor:pointer;font:inherit}
++.hub-btn.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
++.hub-btn:disabled{opacity:.5;cursor:default}
++.hub-note,.hub-status{font-size:.85em;color:var(--fg-muted);margin:4px 0}
++.hub-status.err{color:var(--color-error,var(--red))}
++.hub-status.ok{color:var(--fg)}
++.hub-link{font-size:.85em;color:var(--accent)}
++.hub-list{border:1px solid var(--border);border-radius:6px;max-height:300px;overflow:auto;margin:8px 0}
++.hub-model{display:flex;gap:8px;align-items:center;padding:5px 8px;border-bottom:1px solid var(--border);cursor:pointer;flex-wrap:wrap}
++.hub-model:last-child{border-bottom:0}
++.hub-model-name{font-weight:500}
++.hub-model-id{font-size:.8em;color:var(--fg-muted)}
++.hub-badge{font-size:.72em;padding:1px 6px;border-radius:9px;border:1px solid var(--border);color:var(--fg-muted)}
++.hub-badge.free{color:var(--accent);border-color:var(--accent)}
++.hub-badge.local{color:var(--fg);background:var(--panel)}
++.hub-card{border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin:8px 0;background:var(--panel)}
++.hub-card summary{cursor:pointer;font-weight:500}
++.hub-card.final{border-color:var(--accent)}
++.hub-pre{white-space:pre-wrap;word-break:break-word;margin:6px 0 0;font:inherit}
++.hub-members .hub-inline select{flex:1}
++`;
++  document.head.append(h('style', { id: 'odysseus-hub-css' }, css));
++}
++
++// --------------------------------------------------------------------------- Connect tab
++function connectPane() {
++  const st = { presets: [], preset: null, discovery: null, selected: new Set(), userPickedProvider: false };
++  const provSel = h('select', { class: 'hub-input', 'aria-label': 'Provider' });
++  const keyInput = h('input', { class: 'hub-input', type: 'password', autocomplete: 'off', spellcheck: 'false', placeholder: 'Paste your API key', 'aria-label': 'API key' });
++  const urlInput = h('input', { class: 'hub-input', type: 'text', placeholder: 'http://host:port/v1', 'aria-label': 'Base URL' });
++  const urlRow = h('div', { class: 'hub-row hidden' }, h('label', {}, 'Base URL (OpenAI-compatible)'), urlInput);
++  const keyRow = h('div', { class: 'hub-row' }, h('label', {}, 'API key'), keyInput);
++  const keyLink = h('a', { href: '#', target: '_blank', rel: 'noopener noreferrer', class: 'hub-link hidden' }, 'Get a key');
++  const note = h('div', { class: 'hub-note' });
++  const fetchBtn = h('button', { class: 'hub-btn primary', type: 'button' }, 'Fetch models');
++  const status = h('div', { class: 'hub-status', role: 'status' });
++  const search = h('input', { class: 'hub-input', type: 'search', placeholder: 'Search models', 'aria-label': 'Search models' });
++  const freeOnly = h('input', { type: 'checkbox', 'aria-label': 'Free only' });
++  const freeLabel = h('label', { class: 'hidden' }, freeOnly, ' Free only');
++  const listBox = h('div', { class: 'hub-list' });
++  const count = h('span', { class: 'hub-note' });
++  const selShown = h('button', { class: 'hub-btn', type: 'button' }, 'Select shown');
++  const selFree = h('button', { class: 'hub-btn hidden', type: 'button' }, 'Select all free');
++  const selNone = h('button', { class: 'hub-btn', type: 'button' }, 'Clear');
++  const addPool = h('input', { type: 'checkbox', checked: true, 'aria-label': 'Add to Auto pool' });
++  const connectBtn = h('button', { class: 'hub-btn primary', type: 'button', disabled: true }, 'Connect');
++  const result = h('div', { class: 'hub-status', role: 'status' });
++  const modelsBox = h('div', { class: 'hidden' },
++    h('div', { class: 'hub-inline' }, search, freeLabel, selShown, selFree, selNone, count), listBox,
++    h('div', { class: 'hub-inline' }, h('label', {}, addPool, ' Also add to the Auto pool'), connectBtn), result);
++
++  const say = (el, text, cls = '') => { el.textContent = text; el.className = `hub-status ${cls}`.trim(); };
++
++  function applyPreset() {
++    const p = st.presets.find((x) => x.id === provSel.value) || null;
++    st.preset = p;
++    st.discovery = null; st.selected = new Set();
++    modelsBox.classList.add('hidden');
++    if (!p) return;
++    const showUrl = p.id === 'custom' || p.local;
++    urlRow.classList.toggle('hidden', !showUrl);
++    urlInput.value = p.local ? p.base_url : '';
++    keyRow.classList.toggle('hidden', !p.needs_key && p.local);
++    keyInput.placeholder = p.needs_key ? 'Paste your API key' : 'API key (optional)';
++    keyLink.classList.toggle('hidden', !p.key_url);
++    if (p.key_url) keyLink.href = p.key_url;
++    note.textContent = p.note || '';
++    say(status, '');
++  }
++
++  function updateCount() {
++    const total = st.discovery ? st.discovery.models.length : 0;
++    count.textContent = `${st.selected.size} selected of ${total}`;
++    connectBtn.disabled = st.selected.size === 0;
++    connectBtn.textContent = st.selected.size ? `Connect ${st.selected.size} model${st.selected.size === 1 ? '' : 's'}` : 'Connect';
++  }
++
++  const badge = (text, cls = '') => h('span', { class: `hub-badge ${cls}`.trim() }, text);
++  function renderList() {
++    listBox.textContent = '';
++    const all = st.discovery ? st.discovery.models : [];
++    const shown = filterModels(all, { query: search.value, freeOnly: freeOnly.checked });
++    for (const m of shown.slice(0, 200)) {
++      const cb = h('input', { type: 'checkbox', checked: st.selected.has(m.id), 'aria-label': `Select ${m.id}` });
++      cb.addEventListener('change', () => { if (cb.checked) st.selected.add(m.id); else st.selected.delete(m.id); updateCount(); });
++      listBox.append(h('label', { class: 'hub-model', title: m.id }, cb, h('span', { class: 'hub-model-name' }, m.name || m.id),
++        m.name && m.name !== m.id ? h('span', { class: 'hub-model-id' }, m.id) : null,
++        m.free === true ? badge('free', 'free') : null, m.local ? badge('offline', 'local') : null,
++        m.vision ? badge('vision') : null, m.tools ? badge('tools') : null, m.reasoning ? badge('reasoning') : null,
++        m.context_length ? badge(formatCtx(m.context_length)) : null));
++    }
++    if (shown.length > 200) listBox.append(h('div', { class: 'hub-note' }, `Showing the first 200 of ${shown.length}. Type in the search box to narrow it down.`));
++    if (!shown.length) listBox.append(h('div', { class: 'hub-note' }, 'No models match.'));
++    updateCount();
++  }
++
++  async function fetchModels() {
++    if (!st.preset) return;
++    fetchBtn.disabled = true; say(status, 'Fetching models…'); modelsBox.classList.add('hidden'); say(result, '');
++    try {
++      const d = await api('/api/providers/models', { method: 'POST', json: { provider: st.preset.id, api_key: keyInput.value.trim(), base_url: urlInput.value.trim() } });
++      st.discovery = d; st.selected = new Set();
++      // Small catalogs: tick everything. Big ones (OpenRouter): the user chooses.
++      if (d.models.length <= 15) d.models.forEach((m) => st.selected.add(m.id));
++      freeLabel.classList.toggle('hidden', !d.free_count); selFree.classList.toggle('hidden', !d.free_count);
++      freeOnly.checked = false; search.value = '';
++      const extra = [];
++      if (d.key_info && d.key_info.is_free_tier === true) extra.push('free-tier key');
++      if (d.free_count) extra.push(`${d.free_count} free`);
++      say(status, `${d.label}: ${d.count} model${d.count === 1 ? '' : 's'}${extra.length ? ` (${extra.join(', ')})` : ''}.`, 'ok');
++      modelsBox.classList.remove('hidden'); renderList();
++    } catch (err) { say(status, err.message, 'err'); } finally { fetchBtn.disabled = false; }
++  }
++
++  async function connect() {
++    const p = st.preset; const d = st.discovery; const ids = [...st.selected];
++    if (!p || !d || !ids.length) return;
++    connectBtn.disabled = true; say(result, 'Connecting…');
++    try {
++      const form = new FormData();
++      form.append('name', p.label.replace(/\s*\(local\)$/, ''));
++      form.append('base_url', d.base_url);
++      form.append('api_key', keyInput.value.trim());
++      form.append('endpoint_kind', p.local ? 'local' : (p.id === 'custom' ? 'auto' : 'api'));
++      form.append('pinned_models', JSON.stringify(ids));
++      form.append('require_models', 'false');
++      const ep = await api('/api/model-endpoints', { method: 'POST', form });
++      let msg = `Connected ${p.label}: ${ids.length} model${ids.length === 1 ? '' : 's'} added to the model picker.`;
++      if (addPool.checked) {
++        const cur = await poolStore.load();
++        const merged = mergePool(cur.pool, toPoolEntries(ep.id, d.models, ids), cur.max_pool || 60);
++        await poolStore.save(merged.pool, cur.settings);
++        msg += ` ${merged.added} added to the Auto pool${merged.skipped ? ` (${merged.skipped} skipped: pool is full)` : ''}.`;
++      }
++      keyInput.value = '';   // the key now lives, encrypted, on the server only
++      try { if (window.modelsModule && window.modelsModule.refreshModels) await window.modelsModule.refreshModels(true); } catch (_) { /* picker refresh is best effort */ }
++      say(result, msg, 'ok'); notify(`Connected ${p.label}`);
++    } catch (err) { say(result, err.message, 'err'); } finally { updateCount(); }
++  }
++
++  let guessTimer = null;
++  keyInput.addEventListener('input', () => {
++    clearTimeout(guessTimer);
++    const v = keyInput.value.trim();
++    if (st.userPickedProvider || v.length < 6) return;
++    guessTimer = setTimeout(async () => {
++      try {
++        const { candidates } = await api('/api/providers/guess', { method: 'POST', json: { api_key: v } });
++        if (candidates.length === 1 && provSel.value !== candidates[0] && st.presets.some((p) => p.id === candidates[0])) { provSel.value = candidates[0]; applyPreset(); }
++        else if (candidates.length > 1) note.textContent = `This key looks like one from: ${candidates.join(' or ')}. Pick the provider above.`;
++      } catch (_) { /* guessing is a convenience only */ }
++    }, 250);
++  });
++  provSel.addEventListener('change', () => { st.userPickedProvider = true; applyPreset(); });
++  fetchBtn.addEventListener('click', fetchModels);
++  keyInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') fetchModels(); });
++  search.addEventListener('input', renderList);
++  freeOnly.addEventListener('change', renderList);
++  selShown.addEventListener('click', () => { filterModels(st.discovery?.models, { query: search.value, freeOnly: freeOnly.checked }).forEach((m) => st.selected.add(m.id)); renderList(); });
++  selFree.addEventListener('click', () => { (st.discovery?.models || []).filter((m) => m.free === true).forEach((m) => st.selected.add(m.id)); renderList(); });
++  selNone.addEventListener('click', () => { st.selected.clear(); renderList(); });
++  connectBtn.addEventListener('click', connect);
++
++  const el = h('section', { class: 'hub-pane', dataset: { pane: 'connect' } },
++    h('div', { class: 'hub-note' }, 'Pick a provider, paste its API key, and the available models are fetched for you. No URLs to copy.'),
++    h('div', { class: 'hub-row' }, h('label', {}, 'Provider'), provSel), keyRow, urlRow,
++    h('div', { class: 'hub-inline' }, fetchBtn, keyLink), note, status, modelsBox);
++
++  return {
++    el,
++    async onShow() {
++      if (st.presets.length) return;
++      try {
++        st.presets = (await api('/api/providers/presets')).presets;
++        provSel.textContent = '';
++        for (const p of st.presets) provSel.append(h('option', { value: p.id }, p.label));
++        applyPreset();
++      } catch (err) { say(status, `Could not load providers: ${err.message}`, 'err'); }
++    },
++  };
++}
++
++// --------------------------------------------------------------------------- Auto tab
++function autoPane() {
++  const enabled = h('input', { type: 'checkbox', checked: auto.enabled(), 'aria-label': 'Use Auto for new messages' });
++  const keepLocal = h('input', { type: 'checkbox', checked: auto.keepLocal(), 'aria-label': 'Keep this machine only' });
++  const routerSel = h('select', { class: 'hub-input', 'aria-label': 'Router model' });
++  const defaultSel = h('select', { class: 'hub-input', 'aria-label': 'Default model' });
++  const keepDefault = h('input', { type: 'checkbox', 'aria-label': 'Keep local by default' });
++  const listBox = h('div', { class: 'hub-list' });
++  const saveBtn = h('button', { class: 'hub-btn primary', type: 'button' }, 'Save pool');
++  const status = h('div', { class: 'hub-status', role: 'status' });
++  let pool = [];
++  const say = (text, cls = '') => { status.textContent = text; status.className = `hub-status ${cls}`.trim(); };
++
++  function fillSelect(sel, current, blank) {
++    sel.textContent = '';
++    sel.append(h('option', { value: '' }, blank));
++    for (const e of pool) sel.append(h('option', { value: refOf(e) }, labelFor(e)));
++    sel.value = pool.some((e) => refOf(e) === current) ? current : '';
++  }
++
++  function renderPool() {
++    listBox.textContent = '';
++    if (!pool.length) listBox.append(h('div', { class: 'hub-note' }, 'The pool is empty. Use the Connect tab and keep “Also add to the Auto pool” ticked.'));
++    pool.forEach((e, i) => {
++      const tags = h('input', { class: 'hub-input', type: 'text', value: (e.tags || []).join(', '), placeholder: 'tags: code, fast, reasoning', 'aria-label': `Tags for ${e.model}` });
++      tags.addEventListener('change', () => { e.tags = tags.value.split(',').map((t) => t.trim()).filter(Boolean); });
++      const rm = h('button', { class: 'hub-btn', type: 'button', 'aria-label': `Remove ${e.model}` }, 'Remove');
++      rm.addEventListener('click', () => { pool.splice(i, 1); renderPool(); fillSelect(routerSel, routerSel.value, '(none: use pool order)'); fillSelect(defaultSel, defaultSel.value, '(first in pool)'); });
++      listBox.append(h('div', { class: 'hub-model' }, h('span', { class: 'hub-model-name' }, e.label || e.model),
++        h('span', { class: 'hub-model-id' }, e.endpoint_name || ''), h('span', { class: `hub-badge ${e.local ? 'local' : ''}` }, e.local ? 'offline' : 'cloud'),
++        e.free ? h('span', { class: 'hub-badge free' }, 'free') : null, e.available === false ? h('span', { class: 'hub-badge' }, 'endpoint removed') : null, tags, rm));
++    });
++  }
++
++  enabled.addEventListener('change', () => auto.setEnabled(enabled.checked));
++  keepLocal.addEventListener('change', () => auto.setKeepLocal(keepLocal.checked));
++  saveBtn.addEventListener('click', async () => {
++    saveBtn.disabled = true;
++    try {
++      const r = await poolStore.save(pool, { router_ref: routerSel.value, default_ref: defaultSel.value, keep_local_default: keepDefault.checked });
++      say(`Saved ${r.saved} model${r.saved === 1 ? '' : 's'}${r.dropped ? ` (${r.dropped} dropped)` : ''}.`, 'ok');
++      await load();
++    } catch (err) { say(err.message, 'err'); } finally { saveBtn.disabled = false; }
++  });
++
++  async function load() {
++    try {
++      const d = await poolStore.load();
++      pool = d.pool.map((e) => ({ ...e }));
++      fillSelect(routerSel, d.settings.router_ref, '(none: use pool order)');
++      fillSelect(defaultSel, d.settings.default_ref, '(first in pool)');
++      keepDefault.checked = !!d.settings.keep_local_default;
++      enabled.checked = auto.enabled(); keepLocal.checked = auto.keepLocal();
++      renderPool();
++    } catch (err) { say(err.message, 'err'); }
++  }
++
++  const el = h('section', { class: 'hub-pane hidden', dataset: { pane: 'auto' } },
++    h('div', { class: 'hub-note' }, 'Auto sends each message to the best model in your pool. A small router model (cloud or offline) makes the pick; if it is down, the default model is used.'),
++    h('div', { class: 'hub-inline' }, h('label', {}, enabled, ' Use Auto for new messages'), h('label', {}, keepLocal, ' Keep-local: only offline models, and the router must be offline too')),
++    h('div', { class: 'hub-row' }, h('label', {}, 'Router model'), routerSel),
++    h('div', { class: 'hub-row' }, h('label', {}, 'Default model (when the router is unavailable)'), defaultSel),
++    h('div', { class: 'hub-inline' }, h('label', {}, keepDefault, ' Keep-local by default for council runs')),
++    listBox, h('div', { class: 'hub-inline' }, saveBtn), status);
++  return { el, onShow: load };
++}
++
++// --------------------------------------------------------------------------- Council tab
++const PERSONAS = [['', 'No persona'], ['researcher', 'Researcher'], ['logician', 'Logician'], ['contrarian', 'Contrarian'], ['builder', 'Builder']];
++const MODES = [['debate', 'Debate: members revise after reading each other'], ['fanout', 'Fan-out: independent answers, chair merges'], ['verify', 'Verify: a worker drafts, the council reviews it']];
++
++function councilPane() {
++  let pool = [];
++  let members = [];
++  let abort = null;
++  const modeSel = h('select', { class: 'hub-input', 'aria-label': 'Council mode' }, MODES.map(([v, t]) => h('option', { value: v }, t)));
++  const rounds = h('select', { class: 'hub-input', 'aria-label': 'Rounds' }, [1, 2, 3].map((n) => h('option', { value: n, ...(n === 2 ? { selected: true } : {}) }, `${n} round${n > 1 ? 's' : ''}`)));
++  const chairSel = h('select', { class: 'hub-input', 'aria-label': 'Chair model' });
++  const workerSel = h('select', { class: 'hub-input', 'aria-label': 'Worker model' });
++  const workerRow = h('div', { class: 'hub-row hidden' }, h('label', {}, 'Worker (drafts the answer the council will verify; an offline model is typical)'), workerSel);
++  const skillSel = h('select', { class: 'hub-input', 'aria-label': 'Skill' }, h('option', { value: '' }, 'No skill'));
++  const scopeSel = h('select', { class: 'hub-input', 'aria-label': 'Skill scope' }, h('option', { value: 'chair' }, 'Skill: chair only (final voice)'), h('option', { value: 'all' }, 'Skill: every member'));
++  const keepLocal = h('input', { type: 'checkbox', 'aria-label': 'Keep local' });
++  const question = h('textarea', { class: 'hub-input', placeholder: 'What should the council work on?', 'aria-label': 'Question' });
++  const membersBox = h('div', { class: 'hub-members' });
++  const addMember = h('button', { class: 'hub-btn', type: 'button' }, 'Add member');
++  const estimate = h('div', { class: 'hub-note' });
++  const runBtn = h('button', { class: 'hub-btn primary', type: 'button' }, 'Run council');
++  const status = h('div', { class: 'hub-status', role: 'status' });
++  const out = h('div', { class: 'hub-out' });
++  const say = (text, cls = '') => { status.textContent = text; status.className = `hub-status ${cls}`.trim(); };
++  const nameOf = (ref) => { const e = pool.find((x) => refOf(x) === ref); return e ? (e.label || e.model) : ref.split('::')[1] || ref; };
++
++  function fill(sel, keep, blank) {
++    sel.textContent = '';
++    if (blank) sel.append(h('option', { value: '' }, blank));
++    for (const e of pool) sel.append(h('option', { value: refOf(e) }, labelFor(e)));
++    if (keep && pool.some((e) => refOf(e) === keep)) sel.value = keep;
++  }
++
++  function renderMembers() {
++    membersBox.textContent = '';
++    members.forEach((m, i) => {
++      const ms = h('select', { class: 'hub-input', 'aria-label': `Member ${i + 1} model` });
++      for (const e of pool) ms.append(h('option', { value: refOf(e) }, labelFor(e)));
++      ms.value = m.ref; ms.addEventListener('change', () => { m.ref = ms.value; });
++      const ps = h('select', { class: 'hub-input', 'aria-label': `Member ${i + 1} persona` }, PERSONAS.map(([v, t]) => h('option', { value: v }, t)));
++      ps.value = m.persona; ps.addEventListener('change', () => { m.persona = ps.value; });
++      const rm = h('button', { class: 'hub-btn', type: 'button', 'aria-label': `Remove member ${i + 1}` }, 'Remove');
++      rm.addEventListener('click', () => { members.splice(i, 1); renderMembers(); refreshEstimate(); });
++      membersBox.append(h('div', { class: 'hub-inline' }, ms, ps, rm));
++    });
++    addMember.disabled = members.length >= 8 || !pool.length;
++  }
++
++  let estTimer = null;
++  function refreshEstimate() {
++    clearTimeout(estTimer);
++    estTimer = setTimeout(async () => {
++      if (!members.length) { estimate.textContent = ''; return; }
++      try {
++        const p = await api('/api/council/plan', { method: 'POST', json: { mode: modeSel.value, members: members.length, rounds: Number(rounds.value) } });
++        estimate.textContent = `About ${p.calls} model calls, roughly ${p.x_single_call}× the tokens of one answer (rough estimate).`;
++      } catch (_) { estimate.textContent = ''; }
++    }, 150);
++  }
++
++  function addCard(title, text, { open = false, cls = '', tag = '' } = {}) {
++    const card = h('details', { class: `hub-card ${cls}`.trim(), ...(open ? { open: true } : {}) }, h('summary', {}, title, tag ? h('span', { class: 'hub-badge' }, tag) : null), h('pre', { class: 'hub-pre' }, text || ''));
++    out.append(card); return card;
++  }
++
++  function onEvent(ev) {
++    if (ev.type === 'start') {
++      say(`${ev.mode} · ${ev.members.length} members · about ${ev.estimate.calls} calls`);
++    } else if (ev.type === 'draft') {
++      addCard(`Worker draft · ${nameOf(ev.ref)}`, ev.text, { open: true, tag: ev.ok ? '' : 'no draft' });
++    } else if (ev.type === 'member') {
++      const tag = ev.refused ? 'declined' : (!ev.ok ? `failed${ev.error ? ` (${ev.error})` : ''}` : '');
++      addCard(`${ev.name} · round ${ev.round}`, ev.text || '(no answer)', { open: ev.round === 1 && ev.ok, tag });
++    } else if (ev.type === 'chair') {
++      const card = addCard('Final answer (chair)', ev.text, { open: true, cls: 'final', tag: ev.refused ? 'declined' : '' });
++      const copy = h('button', { class: 'hub-btn', type: 'button' }, 'Copy');
++      copy.addEventListener('click', async () => { try { await navigator.clipboard.writeText(ev.text); copy.textContent = 'Copied'; } catch (_) { copy.textContent = 'Copy failed'; } });
++      card.append(copy);
++    } else if (ev.type === 'error') {
++      say(ev.message, 'err');
++    } else if (ev.type === 'done') {
++      say(`Done: ${ev.calls} calls, ${ev.answered} answered${ev.declined ? `, ${ev.declined} declined` : ''}${ev.failed ? `, ${ev.failed} failed` : ''}.`, 'ok');
++    }
++  }
++
++  async function run() {
++    if (abort) { abort.abort(); return; }                       // second click = Stop
++    const q = question.value.trim();
++    if (!q) { say('Type a question first.', 'err'); return; }
++    if (!chairSel.value) { say('Pick a chair model.', 'err'); return; }
++    if (!members.length) { say('Add at least one member.', 'err'); return; }
++    if (modeSel.value === 'verify' && !workerSel.value) { say('Verify mode needs a worker model.', 'err'); return; }
++    out.textContent = ''; say('Running…');
++    abort = new AbortController(); runBtn.textContent = 'Stop';
++    const body = { question: q, mode: modeSel.value, members: members.map((m) => ({ ref: m.ref, persona: m.persona || undefined })), chair: chairSel.value,
++      rounds: Number(rounds.value), worker: modeSel.value === 'verify' ? workerSel.value : '', skill: skillSel.value, skill_scope: scopeSel.value, keep_local: keepLocal.checked };
++    try {
++      const res = await fetch('/api/council/run', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: abort.signal });
++      if (!res.ok) { let d = null; try { d = await res.json(); } catch (_) { /* no body */ } throw new Error(typeof (d && d.detail) === 'string' ? d.detail : `HTTP ${res.status}`); }
++      const reader = res.body.getReader(); const dec = new TextDecoder(); let buf = '';
++      for (;;) {
++        const { value, done } = await reader.read();
++        if (done) break;
++        const parsed = parseSseChunk(buf, dec.decode(value, { stream: true }));
++        buf = parsed.rest; parsed.events.forEach(onEvent);
++      }
++    } catch (err) { if (err.name === 'AbortError') say('Stopped.'); else say(err.message, 'err'); }
++    finally { abort = null; runBtn.textContent = 'Run council'; }
++  }
++
++  modeSel.addEventListener('change', () => { workerRow.classList.toggle('hidden', modeSel.value !== 'verify'); rounds.classList.toggle('hidden', modeSel.value !== 'debate'); refreshEstimate(); });
++  rounds.addEventListener('change', refreshEstimate);
++  addMember.addEventListener('click', () => { if (pool.length) { members.push({ ref: refOf(pool[members.length % pool.length]), persona: '' }); renderMembers(); refreshEstimate(); } });
++  runBtn.addEventListener('click', run);
++
++  const el = h('section', { class: 'hub-pane hidden', dataset: { pane: 'council' } },
++    h('div', { class: 'hub-note' }, 'A council is separate calls, not one mind: each member is its own request, and the app pastes their answers into each other’s next prompt. The same model can sit in several seats, each with a different persona.'),
++    h('div', { class: 'hub-label' }, 'Members'), membersBox, h('div', { class: 'hub-inline' }, addMember),
++    h('div', { class: 'hub-inline' }, modeSel, rounds), workerRow,
++    h('div', { class: 'hub-row' }, h('label', {}, 'Chair (writes the final answer; does not vote)'), chairSel),
++    h('div', { class: 'hub-inline' }, skillSel, scopeSel, h('label', {}, keepLocal, ' Keep-local: offline models only')),
++    question, estimate, h('div', { class: 'hub-inline' }, runBtn), status, out);
++
++  return {
++    el,
++    async onShow() {
++      try {
++        const d = await poolStore.load();
++        pool = d.pool.filter((e) => e.available !== false);
++        fill(chairSel, chairSel.value, ''); fill(workerSel, workerSel.value, '');
++        if (!chairSel.value && pool.length) chairSel.value = refOf(pool[0]);
++        const local = pool.find((e) => e.local); if (local && !workerSel.value) workerSel.value = refOf(local);
++        keepLocal.checked = auto.keepLocal() || !!d.settings.keep_local_default;
++        if (!members.length && pool.length) {
++          const base = pool.slice(0, 3); const personas = ['researcher', 'logician', 'contrarian'];
++          members = Array.from({ length: Math.max(3, base.length) }, (_, i) => ({ ref: refOf(base[i % base.length]), persona: personas[i] }));
++        }
++        members = members.filter((m) => pool.some((e) => refOf(e) === m.ref));
++        renderMembers(); refreshEstimate();
++        if (!pool.length) say('The pool is empty. Connect a provider first and keep “Also add to the Auto pool” ticked.', 'err');
++        else if (status.className.includes('err')) say('');
++      } catch (err) { say(err.message, 'err'); }
++      try {
++        const s = await api('/api/skills');
++        const names = (s.skills || []).map((x) => x && x.name).filter(Boolean);
++        const keep = skillSel.value;
++        skillSel.textContent = ''; skillSel.append(h('option', { value: '' }, 'No skill'));
++        for (const n of names) skillSel.append(h('option', { value: n }, n));
++        skillSel.value = names.includes(keep) ? keep : '';
++      } catch (_) { /* skills are optional */ }
++    },
++  };
++}
++
++// --------------------------------------------------------------------------- hub shell
++let hub = null;
++function ensureHub() {
++  if (hub) return hub;
++  injectCss();
++  const panes = { connect: connectPane(), auto: autoPane(), council: councilPane() };
++  const titles = { connect: 'Connect', auto: 'Auto pool', council: 'Council' };
++  const btns = {};
++  const root = h('div', { id: 'hub-modal', class: 'modal hidden' });
++  const close = () => root.classList.add('hidden');
++  function show(id) {
++    for (const [k, p] of Object.entries(panes)) { p.el.classList.toggle('hidden', k !== id); btns[k].classList.toggle('active', k === id); btns[k].setAttribute('aria-selected', String(k === id)); }
++    panes[id].onShow();
++  }
++  for (const id of Object.keys(panes)) btns[id] = h('button', { class: 'hub-tab', type: 'button', role: 'tab', dataset: { tab: id }, onclick: () => show(id) }, titles[id]);
++  root.append(h('div', { class: 'modal-content hub-content', role: 'dialog', 'aria-label': 'Providers, Auto and Council', style: 'background:var(--bg)' },
++    h('div', { class: 'modal-header' }, h('h4', {}, 'Providers · Auto · Council'), h('button', { class: 'close-btn', type: 'button', 'aria-label': 'Close', onclick: close }, '✖')),
++    h('div', { class: 'hub-tabs', role: 'tablist' }, Object.values(btns)),
++    h('div', { class: 'modal-body hub-body' }, Object.values(panes).map((p) => p.el))));
++  root.addEventListener('click', (e) => { if (e.target === root) close(); });
++  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !root.classList.contains('hidden')) close(); });
++  document.body.append(root);
++  hub = { root, show, close, open(tab = 'connect') { root.classList.remove('hidden'); show(tab); } };
++  return hub;
++}
++
++// --------------------------------------------------------------------------- entry points
++function mountPickerControls() {
++  const menu = document.getElementById('model-picker-menu');
++  if (!menu || menu.querySelector('[data-hub-mounted]')) return;
++  const addBtn = document.getElementById('model-picker-add-models-btn');
++  if (addBtn) {
++    const keyBtn = h('button', { type: 'button', class: 'model-picker-action-btn', id: 'model-picker-connect-btn', title: 'Connect a provider with an API key', 'aria-label': 'Connect a provider with an API key', dataset: { hubMounted: '1' } }, 'API key');
++    keyBtn.addEventListener('click', (e) => { e.stopPropagation(); ensureHub().open('connect'); });
++    addBtn.insertAdjacentElement('afterend', keyBtn);
++  }
++  const list = document.getElementById('model-picker-list');
++  const enabled = h('input', { type: 'checkbox', checked: auto.enabled(), 'aria-label': 'Auto mode' });
++  const keep = h('input', { type: 'checkbox', checked: auto.keepLocal(), 'aria-label': 'Keep local' });
++  enabled.addEventListener('change', () => auto.setEnabled(enabled.checked));
++  keep.addEventListener('change', () => auto.setKeepLocal(keep.checked));
++  const poolBtn = h('button', { type: 'button', class: 'hub-btn', title: 'Edit the Auto pool' }, 'Pool');
++  poolBtn.addEventListener('click', (e) => { e.stopPropagation(); ensureHub().open('auto'); });
++  const councilBtn = h('button', { type: 'button', class: 'hub-btn', title: 'Open the council' }, 'Council');
++  councilBtn.addEventListener('click', (e) => { e.stopPropagation(); ensureHub().open('council'); });
++  const row = h('div', { class: 'hub-inline', style: 'padding:6px 10px;border-bottom:1px solid var(--border);font-size:.85em', dataset: { hubMounted: '1' } },
++    h('label', { title: 'Let the router pick a model for each message' }, enabled, ' Auto'), h('label', { title: 'Offline models only' }, keep, ' Keep local'), poolBtn, councilBtn);
++  if (list) list.insertAdjacentElement('beforebegin', row); else menu.append(row);
++}
++
++export function init() {
++  injectCss();
++  mountPickerControls();
++}
++
++if (typeof window !== 'undefined') {
++  window.odysseusAuto = auto;
++  window.odysseusHub = { open: (tab) => ensureHub().open(tab), close: () => hub && hub.close() };
++  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
++}
+-- 
+2.43.0
+
