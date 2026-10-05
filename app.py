@@ -744,6 +744,12 @@ app.include_router(setup_embedding_routes())
 from routes.model_routes import setup_model_routes
 app.include_router(setup_model_routes(model_discovery))
 
+# Provider onboarding (pick provider + paste key -> model list) and Auto mode / council.
+from routes.provider_routes import setup_provider_routes
+app.include_router(setup_provider_routes())
+from routes.auto_routes import setup_auto_routes
+app.include_router(setup_auto_routes(skills_manager))
+
 # GitHub Copilot device-flow login
 from routes.copilot_routes import setup_copilot_routes
 app.include_router(setup_copilot_routes())

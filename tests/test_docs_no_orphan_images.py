@@ -21,6 +21,7 @@ PUBLIC_GUIDES = {
     "backup-restore.md",
     "email-outlook.md",
     "pr-blocker-audit.md",
+    "providers-auto-council.md",
     "security-ci.md",
     "setup.md",
 }
