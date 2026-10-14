@@ -18,6 +18,90 @@ Repository topology:
 The fork is normally a pure mirror of upstream `dev`. Merge from `source/dev`,
 not from upstream directly, so the owner controls which upstream state arrives.
 
+Since PR #10 the merge is automated (next section). The manual fast path is
+what the automation runs; you need it when the workflow reports a conflict or
+when you want to drive a sync by hand.
+
+## Automation
+
+`.github/workflows/upstream-sync.yml` runs `.github/scripts/upstream_sync.py`
+on every push to `main`, daily at 02:17 UTC, on manual dispatch (Actions ->
+"Upstream sync" -> Run workflow) and on a `repository_dispatch` event of type
+`upstream-sync`. Each run fetches `source/dev`, finds the merge base with
+`origin/main` and ends in one of these states:
+
+| State | What the run does |
+|---|---|
+| `main` already contains the upstream tip | Nothing to merge. Closes a leftover sync PR, deletes the `sync/upstream` branch if only the bot committed to it, closes an open conflict issue. |
+| Clean merge | Rebuilds `sync/upstream` = `origin/main` + merge of `source/dev` (`main` is the first parent), runs the static quick gate (`--check-only`, see Verification), pushes with `--force-with-lease`, opens **one** PR against `main` or refreshes the existing one in place (title `chore(sync): ...`, body in the PR template format, label `upstream-sync`, `Part of #<tracking issue>`). If the previous run produced the same tree, nothing is pushed. |
+| Conflict | Aborts the merge, pushes nothing, opens or updates **one** issue (labels `upstream-sync` + `merge conflict`) listing the conflicted files with their manifest rule from the table below and the exact commands to resolve locally. A stale sync PR is closed because it can no longer merge. The run ends green with a warning annotation; the issue is the signal. |
+| Refusal | Red run with an `::error::` annotation: no merge base (histories disconnected, see Appendix A), or `sync/upstream` carries commits the bot did not author (merge or delete that branch). |
+
+What it never does: push to `main`, rewrite downstream commits, resolve a
+conflict by itself, or overwrite a human's commit on `sync/upstream`. Review and
+merge the PR as usual; CI runs on it like on any other PR.
+
+One-time setup:
+
+1. Merge PR #10 with **Create a merge commit**. It carries the merge commit that
+   links the histories; until it is on `main` every run stops with "share no
+   history". Never squash or rebase a sync PR (that drops the link and the next
+   sync conflicts everywhere). Keep "Allow merge commits" enabled in Settings ->
+   General.
+2. Add the repository secret `UPSTREAM_SYNC_TOKEN`: a fine-grained personal
+   access token (Settings -> Developer settings -> Fine-grained tokens),
+   resource owner = the repository owner, repository access = only this
+   repository, permissions **Contents: read and write**, **Pull requests: read
+   and write**, **Issues: read and write**, **Workflows: read and write**
+   (Metadata is added automatically). Reasons: pull requests opened with the
+   default `GITHUB_TOKEN` do not trigger CI, and that token cannot push commits
+   that touch `.github/workflows/*`, which upstream changes regularly. Note the
+   expiry date; when the token expires the workflow silently falls back to
+   `GITHUB_TOKEN` and says so in the PR body and in a warning annotation.
+3. Optional, for hands-off merging: repository variable
+   `UPSTREAM_SYNC_AUTO_MERGE` = `true`, plus Settings -> General -> "Allow
+   auto-merge", plus a branch protection rule or ruleset on `main` with required
+   status checks (the pytest shards, Secret scan, Workflow security, PR
+   description check). GitHub refuses auto-merge without required checks; the
+   run then logs a warning and leaves the PR for a human. Auto-merge is skipped
+   when the static quick gate failed.
+4. First run: Actions -> "Upstream sync" -> Run workflow with `dry_run` = true,
+   then read the job summary. A dry run pushes and opens nothing.
+
+Day to day:
+
+- New upstream commits arrive when the fork is updated (`gh repo sync`, see
+  below, or GitHub's "Sync fork" button); the next scheduled run picks them up.
+  For an immediate run, dispatch the workflow by hand or send
+  `gh api repos/freeforall1932-design/odysseus-fork-but-api-dev/dispatches -f event_type=upstream-sync`
+  (a workflow in the fork can do that on push with a token that has
+  Contents: write on this repository).
+- Every push to `main` rebuilds the open sync PR on top of it, so downstream
+  work never makes the sync PR stale; the PR number stays the same.
+- To pause: close the sync PR. It is not reopened until `main` or upstream
+  moves. To stop: disable the workflow in the Actions tab. GitHub also pauses
+  schedules after 60 days without repository activity; re-enable from the same
+  tab.
+- A conflict issue means a 15-30 minute manual job: run the commands in the
+  issue (the fast path below with the upstream commit filled in), open a normal
+  PR, merge it with a merge commit. The next run closes the issue.
+- The PR author is the token's owner, so the PR description and title checks
+  run and pass on the generated body. A sync PR is UI-sensitive by nature
+  (upstream touches `static/`), so the description bot leaves its advisory
+  screenshot comment; that is expected.
+
+Local use: `python .github/scripts/upstream_sync.py --dry-run` performs the
+same analysis on your machine (needs `gh auth login` for the PR/issue lookups;
+`--offline` skips them) and leaves `sync/upstream` checked out for inspection.
+`--check-only` runs the static quick gate against the working tree.
+`tests/test_upstream_sync_script.py` exercises the script end to end against
+throwaway local repositories.
+
+Known limits: conflicts are not auto-resolved (the hot spots in the manifest
+need judgment; scripting the re-application of the manifest deltas is the
+natural next step), and the static gate is a smoke test, not a substitute for
+CI on the PR.
+
 ## Fast path
 
 ```bash
@@ -75,6 +159,7 @@ else means upstream content was dropped or downstream content leaked.
 | `routes/skills_routes.py` | `body.model_dump(exclude_none=True)` instead of `body.dict(...)`. | Same. |
 | `.gitleaks.toml` | Upstream's file plus a second `[[allowlists]]` block for the historical `sk-LEAKTEST-123456` literal. | Keep every upstream block and the downstream block appended. Both are needed: upstream's for `THIRD_PARTY_PROVENANCE.json`, ours because `gitleaks git` scans history. |
 | `audit.md`, `SESSION_HANDOFF.md`, `WORKLIST.md`, `UPSTREAM_SYNC.md` | Downstream documents. | Cannot conflict. |
+| `.github/workflows/upstream-sync.yml`, `.github/scripts/upstream_sync.py`, `tests/test_upstream_sync_script.py` | The sync automation (see "Automation"). | Downstream-only. If upstream adds a file at the same path, keep ours and rename only if the two really collide. The script's symbol and integration-point lists mirror this table and the Verification section: update them together. |
 
 Upstream integration points the downstream UI depends on (check these if
 upstream reworked the model picker or settings):
@@ -116,30 +201,21 @@ Quick gate (about a minute). Run before committing:
 
 ```bash
 grep -rn -E '^(<<<<<<< |>>>>>>> )' --exclude-dir=.git --exclude-dir=node_modules . ; echo "markers exit=$? (1 = none left)"
-node --check static/js/chat.js && node --check static/sw.js
 
-# Downstream modules import these upstream symbols. All must print OK.
-check() { grep -q -E "^(def|class|async def) $2\b|^$2\s*=" "$1" && echo "OK      $1::$2" || echo "MISSING $1::$2"; }
-check core/database.py ModelEndpoint;            check core/database.py SessionLocal
-check src/auth_helpers.py owner_filter;          check src/auth_helpers.py require_api_token_scope
-check src/endpoint_resolver.py resolve_endpoint_by_id
-check src/llm_core.py llm_call_async
-check routes/model_routes.py _classify_endpoint; check routes/model_routes.py _rewrite_loopback_for_docker
-check core/middleware.py require_admin;          check src/tls_overrides.py llm_verify
-check services/memory/skill_format.py parse_frontmatter
-check routes/prefs_routes.py _load_for_user
-grep -n "skills_manager\s*=" app.py | head -1    # the Auto routes include needs it
+# Static quick gate, the same one the automation runs after its merge: the upstream
+# symbols downstream modules import, the downstream lines inside upstream-owned
+# files (manifest rows), every precached asset and index.html script exists,
+# `node --check` on the touched JS, `py_compile` on the downstream modules.
+# All rows must say PASS. The lists live at the top of the script.
+python .github/scripts/upstream_sync.py --check-only
 
-# Every precached asset and every index.html script must exist.
-node -e 'const fs=require("fs");const m=fs.readFileSync("static/sw.js","utf8").match(/const PRECACHE = \[([\s\S]*?)\];/);const miss=[...m[1].matchAll(/\x27([^\x27]+)\x27/g)].map(x=>x[1].split("?")[0]).filter(p=>p.startsWith("/static/")&&!fs.existsSync("."+p));console.log("precache missing:",miss);process.exit(miss.length?1:0)'
-node -e 'const fs=require("fs");const miss=[...fs.readFileSync("static/index.html","utf8").matchAll(/<script[^>]+src="(\/static\/[^"?]+)/g)].map(m=>m[1]).filter(s=>!fs.existsSync("."+s));console.log("script tags missing:",miss);process.exit(miss.length?1:0)'
-
-# Downstream suites + upstream contracts on the files we touch (about 430 tests, ~10 s).
+# Downstream suites + upstream contracts on the files we touch (about 450 tests, ~10 s).
 # The deselected test needs a Playwright browser, which the sandbox cannot download.
 python -m pytest -q -p no:cacheprovider \
   tests/test_auto_router.py tests/test_council.py tests/test_provider_presets.py tests/test_provider_and_auto_routes.py \
   tests/test_chat_route_tool_policy.py tests/test_frontend_module_graph.py tests/test_model_routes.py \
   tests/test_docs_no_orphan_images.py tests/test_tls_overrides_scope.py tests/test_publication_plan_b.py \
+  tests/test_upstream_sync_script.py \
   --deselect tests/test_publication_plan_b.py::test_browser_publication_behaviors
 
 # Manifest: before the commit compare the index, after the commit compare HEAD.
@@ -219,6 +295,8 @@ Sandbox limits that cost time last sync:
 - `gh run view --log` fails from the sandbox (the log host is not reachable). Use annotations instead: `gh api repos/<owner>/<repo>/check-runs/<job-id>/annotations` with the job id from `gh pr checks <n>`'s URLs, and `gh api repos/<owner>/<repo>/actions/jobs/<job-id> --jq '.steps[] | "\(.conclusion)\t\(.name)"'` for the failing step.
 - `gh pr edit` can fail with a GraphQL "Projects (classic)" deprecation error. Use the REST API: `gh api -X PATCH repos/<owner>/<repo>/pulls/<n> -f title='...'` or `-F body=@file.md`.
 - Reachable: `github.com`, `api.github.com`, `codeload.github.com`, `pypi.org`, `registry.npmjs.org`. Not reachable: release assets (`release-assets.githubusercontent.com`, so no gitleaks binary), Playwright browser downloads, Go module proxy.
+- A restored Arena sandbox can come back with `.git` reset to the session's base commit, the merged files sitting as uncommitted changes, the `source` remote gone, and directories named `build/` (for example `static/js/editor/build/`) stale, because snapshots exclude them. The pushed branch is the truth: `git fetch origin <branch> && git reset --hard origin/<branch> && git clean -fd`, then re-add the `source` remote (fast path step 0). Compare first if unsure: `cp .git/index /tmp/idx && GIT_INDEX_FILE=/tmp/idx git add -A && git diff --stat $(GIT_INDEX_FILE=/tmp/idx git write-tree) origin/<branch>`.
+- Lint workflows locally with the same tools as CI: `pip install zizmor==1.25.2` works; the actionlint binary cannot be downloaded (release asset), but `npm install actionlint` in a scratch directory gives an older WASM build that still catches syntax and expression errors (it does not know the `vars` context or recent runner labels; ignore those two findings).
 
 ## Updating the fork from upstream first (optional)
 
