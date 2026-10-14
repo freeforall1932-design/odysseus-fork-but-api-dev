@@ -1,5 +1,7 @@
 """HTTP layer for provider onboarding, the Auto pool/router and the council runner (all collaborators mocked)."""
 import json
+import re
+from pathlib import Path
 
 import pytest
 from fastapi import FastAPI, HTTPException
@@ -438,3 +440,37 @@ def test_an_unexpected_crash_ends_the_stream_cleanly(env, monkeypatch):
     monkeypatch.setattr(auto_routes.cn, "run_council", boom)
     events, done = sse(c.post("/api/council/run", json={"question": "Q", "members": members()[:1], "chair": "or::meta/llama:free"}))
     assert done and events[-1] == {"type": "error", "message": "The council failed unexpectedly."}   # no stack trace leaks
+
+
+# --------------------------------------------------------------------------- frontend source guards
+_CHAT_JS = Path(__file__).resolve().parent.parent / "static" / "js" / "chat.js"
+_JS_REGEX_LITERAL = re.compile(r"/(?:\\.|\[(?:\\.|[^\]])*\]|[^/\n\\\[])+/[a-z]*")
+
+
+def _regex_literals(block: str) -> list[str]:
+    return [m.group(0) for m in _JS_REGEX_LITERAL.finditer(block)]
+
+
+def _chat_js_block(source: str, start_needle: str, end_needle: str) -> str:
+    start = source.index(start_needle)
+    end = source.index(end_needle, start)
+    return source[start:end]
+
+
+def test_auto_hint_mirrors_agent_mode_workspace_heuristic():
+    """The Auto pre-send hint must classify workspace intent exactly like Agent-mode promotion.
+
+    The Agent-mode block is upstream-owned and guarded by test_chat_route_tool_policy;
+    detectWorkspaceAgentIntent() is a downstream mirror that runs before the request is
+    built. Keeping the regex literals identical prevents the two from drifting apart.
+    """
+    source = _CHAT_JS.read_text(encoding="utf-8")
+    helper = _chat_js_block(source, "function detectWorkspaceAgentIntent(", "const RESEARCH_SVG")
+    agent_mode = _chat_js_block(source, "const _messageText = String(msg || '');", "const workspaceAgentIntent =")
+    helper_regexes = _regex_literals(helper)
+    agent_mode_regexes = _regex_literals(agent_mode)
+    assert len(agent_mode_regexes) >= 4, agent_mode_regexes
+    assert helper_regexes == agent_mode_regexes
+    # The hint must feed the router from the mirror, not from a stale ad-hoc pattern.
+    assert "const _autoWorkspaceIntent = !isIncognitoForSend && detectWorkspaceAgentIntent(msg);" in source
+    assert "WORKSPACE_AGENT_INTENT_RE" not in source
