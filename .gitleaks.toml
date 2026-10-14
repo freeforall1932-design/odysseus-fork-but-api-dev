@@ -1,0 +1,38 @@
+# Gitleaks configuration: the built-in default rules plus two narrow exceptions.
+#
+# THIRD_PARTY_PROVENANCE.json keys its transitive npm notices by
+# "<package>_<version>" ("key": "inherits_2.0.4"). Four of those identifiers
+# trip the default generic-api-key rule. They are package names, not secrets.
+# The exception below applies only to that rule, only in that file, and only
+# to those four exact values; every other rule and file is scanned as usual.
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Reviewed package identifiers in THIRD_PARTY_PROVENANCE.json"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''(?:^|/)THIRD_PARTY_PROVENANCE\.json$''']
+regexTarget = "secret"
+regexes = [
+  '''^inherits_2\.0\.4$''',
+  '''^bluebird_3\.4\.7$''',
+  '''^inherits_2\.0\.1$''',
+  '''^inherits_2\.0\.3$''',
+]
+
+# Downstream (this repository only): a placeholder string that lives in this
+# repository's *history*. Commits c605cbfc and 4001952f carried a test fixture
+# asserting that provider error messages never echo the caller's API key. The
+# literal was never a real credential, but it has enough entropy to trip the
+# generic-api-key rule, and `gitleaks git` scans history, so correcting the
+# current tree (done) does not clear the scan on its own. The regex is anchored
+# to the exact literal and cannot mask anything else.
+
+[[allowlists]]
+description = "Historical downstream test fixture placeholder (not a credential)"
+regexTarget = "secret"
+regexes = [
+  '''^sk-LEAKTEST-123456$''',
+]

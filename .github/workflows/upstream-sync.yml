@@ -1,0 +1,99 @@
+# Upstream sync (keeps main current with the upstream fork)
+#
+# Purpose: this repository carries downstream customizations on top of
+# freeforall1932-design/odysseus-fork-but-api (a mirror of odysseus-dev/odysseus).
+# This workflow does the merge described in UPSTREAM_SYNC.md automatically and
+# routes the result through a pull request, so downstream work on `main` is
+# never rewritten and the usual CI gates still apply:
+#
+#   - clean merge   -> branch `sync/upstream` is (re)built from `main` + upstream
+#                      and one PR against `main` is opened or refreshed in place.
+#   - merge conflict -> nothing is pushed; one issue (labels `upstream-sync`,
+#                      `merge conflict`) lists the files, the manifest rules and
+#                      the commands to resolve the merge locally.
+#   - up to date    -> leftover sync branch / PR / conflict issue are closed.
+#
+# Triggers: every push to `main` (downstream work rebuilds the sync PR on top of
+# it), a daily schedule (picks up new upstream commits), manual dispatch, and an
+# optional `repository_dispatch` of type `upstream-sync` sent from the fork.
+#
+# One-time setup (details in UPSTREAM_SYNC.md, "Automation"):
+#   - secret UPSTREAM_SYNC_TOKEN: fine-grained PAT for this repository with
+#     Contents, Pull requests, Issues and Workflows read/write. Without it the
+#     workflow falls back to GITHUB_TOKEN, which cannot push upstream changes to
+#     .github/workflows/* and whose PRs do not trigger CI.
+#   - optional repository variable UPSTREAM_SYNC_AUTO_MERGE=true to enable
+#     GitHub auto-merge (merge commit) on the sync PR once required checks pass.
+#
+# The script never pushes to `main` and refuses to overwrite commits on
+# `sync/upstream` that it did not author.
+
+name: Upstream sync
+
+on:
+  schedule:
+    - cron: '17 2 * * *'   # daily, 02:17 UTC (09:17 WIB)
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: Upstream fork to merge from (owner/name)
+        type: string
+        default: freeforall1932-design/odysseus-fork-but-api
+      source_branch:
+        description: Branch of the fork to merge
+        type: string
+        default: dev
+      dry_run:
+        description: Report what would happen; push nothing, open nothing
+        type: boolean
+        default: false
+  repository_dispatch:
+    types: [upstream-sync]
+
+# Default-deny token; the single job grants only what the sync needs.
+permissions: {}
+
+# One sync at a time; a queued run supersedes older queued runs but never
+# cancels a run that may be in the middle of pushing.
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Merge upstream into a sync pull request
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write        # push sync/upstream, delete it when merged
+      pull-requests: write   # open / refresh / close the sync PR
+      issues: write          # tracking + conflict issues, labels, comments
+    env:
+      GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout repository (full history, no persisted credentials)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+
+      # gh's credential helper hands GH_TOKEN to git for pushes; nothing is
+      # written to the checkout's config and the token never appears in a URL.
+      - name: Let git push with the workflow token
+        run: gh auth setup-git
+
+      - name: Merge upstream and open or refresh the sync pull request
+        env:
+          SYNC_SOURCE_REPO: ${{ inputs.source_repo || 'freeforall1932-design/odysseus-fork-but-api' }}
+          SYNC_SOURCE_BRANCH: ${{ inputs.source_branch || 'dev' }}
+          SYNC_DRY_RUN: ${{ inputs.dry_run == true && 'true' || 'false' }}
+          SYNC_AUTO_MERGE: ${{ vars.UPSTREAM_SYNC_AUTO_MERGE || 'false' }}
+          SYNC_TOKEN_SOURCE: ${{ secrets.UPSTREAM_SYNC_TOKEN != '' && 'pat' || 'github-token' }}
+        run: python .github/scripts/upstream_sync.py

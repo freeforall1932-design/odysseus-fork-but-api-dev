@@ -1,9 +1,15 @@
 # Session Handoff
 
-## Current state
+## Upstream sync (read this first)
+
+- This repository shares git history with upstream since merge commit `0f5c3c94` (PR #10, 2026-10-14, upstream `dev` @ `86b886c6`).
+- New upstream commits arrive automatically: the "Upstream sync" workflow (`.github/workflows/upstream-sync.yml`, script `.github/scripts/upstream_sync.py`) merges the fork into a `sync/upstream` PR on every push to `main` and daily, and files an issue when the merge conflicts. Setup (PAT secret `UPSTREAM_SYNC_TOKEN`, optional auto-merge) and the manual procedure are in `UPSTREAM_SYNC.md`; a manual sync is a 15-30 minute three-way merge, and the file lists every downstream customization that must survive, the per-file conflict rules, the verification commands, and the PR/CI gotchas.
+- Never re-import the project from an archive: that disconnects the histories again (recovery recipe is in `UPSTREAM_SYNC.md`, Appendix A).
+
+## Current state (historical: 2026-10-05 extraction session)
 
 - Repository: `/home/user/odysseus-fork-but-api-dev`
-- Required branch: `arena/01a10a87-odysseus-fork-but-api-dev` (do not switch branches)
+- Branch at the time: `arena/01a10a87-odysseus-fork-but-api-dev` (merged since; use your own working branch and open PRs against `main`)
 - The source archive `odysseus-fork-but-api-dev.zip` was deleted at the user's request. The extracted project files remain in the repository root.
 - Audit findings are recorded in `audit.md`; they are **pending approval**. No security-finding remediations were applied. The only source edits after the audit are unrelated deprecation-warning cleanups.
 - Root handoff files created: `audit.md`, `SESSION_HANDOFF.md`, and `WORKLIST.md`.
