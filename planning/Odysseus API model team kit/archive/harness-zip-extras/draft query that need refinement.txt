@@ -1,0 +1,35 @@
+I'm moving this project to a fresh chat, so I need a handoff written from
+this conversation. This is a snapshot job, not a research job: don't
+re-test, re-search, re-verify, or regenerate anything, and don't try to
+open or recreate files (they may no longer exist in this chat's workspace).
+Work only from what's written in this conversation, and tell me when
+something isn't visible or you're unsure. Mark uncertain items [unsure].
+Put "Snapshot as of <today>" at the top of each file.
+
+Write these as separate .md files, one at a time, in this order. Finish and
+present each before starting the next. Let each be as long as its content
+needs. Refer to my files by name instead of repeating their contents; I
+have them offline.
+
+1. HANDOFF.md (start here)
+   - Goal and scope
+   - In progress at cutoff: what my last request(s) asked for, what was
+     finished, what was half-done or about to be done, and the exact next
+     action. If my last "continue" never produced output, say what it
+     would have been.
+   - To-do list: numbered, ordered, each item small enough for one chat
+     session, with dependencies
+   - Constraints and conventions: target repo, naming, preferences, things
+     to avoid
+   - A short opening message I can paste into the new chat
+2. PROVEN.md: decisions and findings that were confirmed (tested,
+   verified, or explicitly agreed), each with one line of evidence or
+   reasoning. Include what was tried and rejected, and any decision that
+   was later reversed (keep the latest, note the reversal).
+3. OPEN.md: unfinished or blocked work and what's missing; questions
+   needing further research (why it matters, what would resolve it);
+   assumptions treated as true but never verified.
+4. FILES.md: every file by name, version (v1/v2), what it contains, status
+   (frozen / in progress / superseded), and whether the next chat needs it
+   uploaded. If you can't tell from this conversation what a file
+   contains, say so.
