@@ -8,14 +8,23 @@
 - Upstream synced: `f48aa82` (zip addition) → `594a44f5` merge of `upstream/dev @ 8877273e` (21 commits, 38 files, 0 conflicts). Intermediate fork still at `9712a540`.
 - Evaluation + sync report: `ZIP_EVALUATION_AND_SYNC_REPORT.md`.
 
-## Next — owner to choose
+## 2026-10-27 — minimal drift (Option A) applied
 
-<!-- Replace this section with your first drift direction. Examples: -->
+- Baseline: `planning/Odysseus API model team kit/reports/FREE_PROVIDER_RESEARCH_2026-10-18.md` §1–6 + `src/provider_presets.py` PRESETS
+- Change: added `free_evidence`/`guard_*` to `ProviderPreset`, updated notes for openrouter/google/groq/mistral/cerebras/nvidia with W-020 dated evidence (limits, 401/429/402 signals, daily ledger, training warnings); see `src/provider_presets.py` diff
+- Reason: W-015 “assume_free” → evidence rule; minimal step before full quota ledger
+- Promoted to: `src/provider_presets.py` (upstream-synced, 176 downstream tests pass)
 
-- [ ] **Drift: providers** — Groq preset + Google/NVIDIA/Mistral free-evidence fixes
-- [ ] **Drift: council** — adaptive council design (W-050) around Odysseus `src/council.py`
-- [ ] **Drift: audit** — P0 hardening before trust (W-010…W-015)
-- [ ] **Drift: docs-only** — keep planning as reference, no code change
+- Baseline: `planning/Odysseus API model team kit/WORKLIST.md` W-050 + `PROJECT_CONTEXT.md §3` adaptive council
+- Change: wrote `planning/ARCHITECTURE.drift.md` — roles (Odysseus room, OAT PR team, LiteLLM), 3 escalations (1 simulated → 2–3 real debate → OAT sequential), pool table per provider, quota ledger design, 3 call-count examples (light 2 calls/1.1k tok, hard 10 calls/12k tok, PR 3 agents), worked 429 minute-by-minute with Retry-After + circuit breaker + plain “resting until” message
+- Reason: satisfy W-050 design requirement without implementation; keep calming-on-error policy
+- Promoted to: `planning/ARCHITECTURE.drift.md` (docs-only, no runtime)
+
+## Next — owner to choose (after minimal)
+
+- [ ] **Drift: providers-pool** — wire `free_evidence`/`guard_*` into `auto_router.prefilter` (skip cooldown/rpd_used, one in-flight) + UI badges
+- [ ] **Drift: audit** — P0 hardening (W-010…W-015) before trust
+- [ ] **Drift: docs-only** — keep planning as reference, close
 
 ### How to record a drift
 

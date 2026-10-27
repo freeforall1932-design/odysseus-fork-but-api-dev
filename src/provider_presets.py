@@ -33,18 +33,28 @@ class ProviderPreset:
     key_prefixes: tuple = ()
     key_url: str = ""
     note: str = ""
+    # Minimal drift — free-tier evidence + guard defaults from W-020 (2026-10-18, planning/reports/FREE_PROVIDER_RESEARCH_*.md)
+    # free_evidence: eligible | conditional | paid-risk | excluded | gone — how W-015 should treat “listed = free”
+    free_evidence: str = "eligible"  # default for paid providers that may have a free tier
+    guard_note: str = ""  # one-line W-015 pacing hint (not enforced here, shown in UI/docs)
+    guard_rpm: Optional[int] = None  # suggested start value; None = unpublished / login-only
+    guard_rpd: Optional[int] = None
 
 
 PRESETS: tuple = (
     ProviderPreset(
         "openrouter", "OpenRouter", "https://openrouter.ai/api/v1", flavor="openrouter",
         key_prefixes=("sk-or-",), key_url="https://openrouter.ai/keys",
-        note="One key, hundreds of models. Free models are detected from the pricing data.",
+        note="Free models end in :free (pricing 0). Limits: 20/min, 50/day → 1,000/day after ≥$10 lifetime credits; 402/429 carry limit_source; GET /key shows remaining.",
+        free_evidence="eligible", guard_rpm=18, guard_rpd=50,
+        guard_note="Pace to daily cap (50/day is only a few turns); reserve for short calls unless $10 purchased.",
     ),
     ProviderPreset(
         "google", "Google Gemini", "https://generativelanguage.googleapis.com/v1beta/openai",
         flavor="google", key_prefixes=("AIza",), key_url="https://aistudio.google.com/apikey",
-        note="Use an AI Studio key. Whether a model is free depends on your quota, so it is not flagged.",
+        note="Free tier exists for Flash-class models only (per-model pricing page); exact limits are login-only in AI Studio (per project, RPD midnight PT). Unpaid use may be used for training.",
+        free_evidence="conditional", guard_rpm=10,
+        guard_note="Start 1 in-flight ≤10 RPM, few-hundred/day self-cap until you read AI Studio numbers.",
     ),
     ProviderPreset(
         "openai", "OpenAI", "https://api.openai.com/v1",
@@ -57,10 +67,15 @@ PRESETS: tuple = (
     ProviderPreset(
         "groq", "Groq", "https://api.groq.com/openai/v1",
         key_prefixes=("gsk_",), key_url="https://console.groq.com/keys",
+        note="Permanent free tier (published per-model RPM/RPD/TPM/TPD; e.g. 30 RPM/1K RPD/8K TPM/200K TPD). No training on data; strongest new free candidate.",
+        free_evidence="eligible", guard_rpm=30, guard_rpd=1000,
+        guard_note="Encode per-model RPD/TPD as budget; 1–2 in-flight; x-ratelimit + retry-after on 429.",
     ),
     ProviderPreset(
         "mistral", "Mistral", "https://api.mistral.ai/v1",
         key_url="https://console.mistral.ai/api-keys",
+        note="Free mode = included monthly allowance (limits login-only on account Limits page). Keep pay-as-you-go OFF (suspends at limit); Free-mode data may train (opt-out in Privacy). Labs models always train — exclude by default.",
+        free_evidence="conditional", guard_note="Local monthly token ledger; 1 in-flight; 429 tokens/month = stop until next month.",
     ),
     ProviderPreset(
         "deepseek", "DeepSeek", "https://api.deepseek.com/v1",
@@ -73,10 +88,15 @@ PRESETS: tuple = (
     ProviderPreset(
         "cerebras", "Cerebras", "https://api.cerebras.ai/v1",
         key_prefixes=("csk-",), key_url="https://cloud.cerebras.ai",
+        note="No permanent free tier since 2026-07 (excluded by default): $5 after payment method, 30-day expiry. Remove from free-only pool.",
+        free_evidence="paid-risk", guard_note="Excluded from free-only pool; trial-only with payment.",
     ),
     ProviderPreset(
         "nvidia", "NVIDIA NIM", "https://integrate.api.nvidia.com/v1",
         key_prefixes=("nvapi-",), key_url="https://build.nvidia.com",
+        note="No-cost trial for prototyping (credits removed); rate limits unpublished — your max shows in build.nvidia.com account UI (often ~40 RPM). Production needs AI Enterprise licence.",
+        free_evidence="conditional", guard_rpm=6,
+        guard_note="Default 1 in-flight, ~6–10 RPM, lengthen cooldown on 429; add manual my-account-limit field.",
     ),
     ProviderPreset(
         "xai", "xAI", "https://api.x.ai/v1",
