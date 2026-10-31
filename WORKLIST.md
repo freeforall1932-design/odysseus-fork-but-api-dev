@@ -149,6 +149,8 @@ What was actually re-verified rather than assumed:
 | The pool card works in a browser | **not possible here** (no Playwright/Chromium) | Open — B10 |
 | A removed/replaced endpoint key stops being used immediately | **was wrong**: the pool cache also cached the endpoint's own key for 15 s, so a revoked key kept being sent. 28 upstream authority tests caught it; the primary is now never cached | Fixed (`d579f4ac`) — regression test added |
 | A new env var is documented | **was wrong**: `ODYSSEUS_KEY_POOL_DISABLED` had no note, so the generated config reference went stale (3 failures) | Fixed — note added, page regenerated |
+| The service-worker cache bump keeps upstream's editor suites green | **was wrong**: the previous sync appended `-providerhub`, but upstream asserts `re.fullmatch(r'odysseus-v\d+-pr40-editor-precache')` → 43 failures. Now `odysseus-v1116-pr40-editor-precache`, and the manifest rule says to increment the number | Fixed (`3029c8ce`) |
+| Full suite vs pristine upstream | ran both trees in full and diffed the failure lists | **only** the 2 known order-dependent `test_provider_and_auto_routes` cases differ (they pass in isolation); everything else also fails on upstream `ef3467e8` in this sandbox |
 | DeepSeek/other `data: {"error": ...}` 200-shaped streams rotate | only the HTTP-status path is handled | Open — B8 |
 
 Not done, and not hidden: Track A (agent team) has not been started; B3/B4/B5, B7–B12,
