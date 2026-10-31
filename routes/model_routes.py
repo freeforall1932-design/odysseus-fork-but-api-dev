@@ -1036,11 +1036,10 @@ def _probe_endpoint(base_url: str, api_key: str = None, timeout: int = 5) -> Lis
             logger.warning(f"Google native models probe failed: {e}")
         return []
     if provider == "anthropic":
-        # Try Anthropic's /v1/models endpoint first
+        # Try Anthropic's /v1/models endpoint first. build_headers also adds
+        # Chatbox's Instance-Id when the base is its Anthropic gateway.
         url = _safe_build_models_url(base)
-        headers = {"anthropic-version": "2023-06-01"}
-        if api_key:
-            headers["x-api-key"] = api_key
+        headers = _safe_build_headers(api_key, base)
         try:
             r = httpx.get(url, headers=headers, timeout=timeout, verify=llm_verify())
             r.raise_for_status()
@@ -2382,7 +2381,11 @@ def setup_model_routes(model_discovery):
             ):
                 from src.endpoint_resolver import _first_chat_model
                 settings["default_endpoint_id"] = ep.id
-                settings["default_model"] = _first_chat_model(model_ids) or ""
+                # Pinned models are real models too: Chatbox AI (and any other
+                # connect flow that skips an unavailable /models probe) supplies
+                # the catalog as pins, so falling back to "" here would leave the
+                # first-run default pointing at an empty model id.
+                settings["default_model"] = _first_chat_model(model_ids) or (_pinned[0] if _pinned else "")
                 _save_settings(settings)
             _invalidate_models_cache()
             _local_probe_cache["data"] = None

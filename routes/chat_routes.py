@@ -2072,7 +2072,10 @@ def _reconcile_selected_route_from_request(
                 if not ep:
                     return False
                 endpoint_url = build_chat_url(normalize_base(ep.base_url or ""))
-                headers = build_headers(ep.api_key or "", ep.base_url or "") if ep.api_key else {}
+                # Build unconditionally: providers that authenticate without a
+                # stored api_key (Chatbox AI license gateways, subscription
+                # endpoints) still contribute protocol headers here.
+                headers = build_headers(ep.api_key or "", ep.base_url or "")
                 resolved_endpoint_id = ep.id
             finally:
                 db.close()

@@ -1077,6 +1077,15 @@ def _detect_provider(url: str) -> str:
     """
     if _is_ollama_native_url(url):
         return "ollama"
+    try:
+        from src.chatbox_ai import is_chatbox_anthropic_url
+
+        # Chatbox AI's Claude gateway speaks the Anthropic Messages API even
+        # though its hostname is not anthropic.com.
+        if is_chatbox_anthropic_url(url):
+            return "anthropic"
+    except Exception:  # pragma: no cover - optional import
+        pass
     if _host_match(url, "anthropic.com"):
         return "anthropic"
     if _host_match(url, "opencode.ai/zen/go"):
@@ -1339,6 +1348,11 @@ def _provider_label(url: str) -> str:
     if _host_match(url, "deepseek.com"): return "DeepSeek"
     if _host_match(url, "nvidia.com"): return "NVIDIA"
     if _host_match(url, "googleapis.com"): return "Google"
+    try:
+        from src.chatbox_ai import is_chatbox_url
+        if is_chatbox_url(url): return "Chatbox AI"
+    except Exception:  # pragma: no cover - optional import
+        pass
     if _host_match(url, "together.xyz", "together.ai"): return "Together"
     if _host_match(url, "fireworks.ai"): return "Fireworks"
     if _host_match(url, "kimi.com"):

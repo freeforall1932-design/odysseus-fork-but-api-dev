@@ -67,6 +67,53 @@ export function mergePool(existing, additions, max = 60) {
 
 export const refOf = (e) => `${e.endpoint_id}::${e.model}`;
 
+// Chatbox AI returns one catalog spanning several gateway protocols. Group the
+// ticked models the same way the server does, so each gateway becomes its own
+// endpoint (OpenAI-compatible and Anthropic-compatible today).
+export function connectGroups(discovery, selectedIds) {
+  const selected = new Set(selectedIds || []);
+  const variants = Array.isArray(discovery?.variants) ? discovery.variants : [];
+  if (variants.length) {
+    return variants
+      .map((v) => ({
+        api_style: v.api_style,
+        label: v.label || '',
+        base_url: v.base_url || '',
+        model_ids: (v.model_ids || []).filter((id) => selected.has(id)),
+      }))
+      .filter((g) => g.model_ids.length && g.base_url);
+  }
+  const models = (discovery?.models || []).filter((m) => selected.has(m.id) && m.supported !== false);
+  const ids = models.map((m) => m.id);
+  return ids.length ? [{ api_style: 'openai', label: '', base_url: discovery?.base_url || '', model_ids: ids }] : [];
+}
+
+function shortNumber(n) {
+  if (!Number.isFinite(n)) return '';
+  if (Math.abs(n) >= 1e6) return `${+(n / 1e6).toFixed(1)}M`;
+  if (Math.abs(n) >= 1e3) return `${+(n / 1e3).toFixed(1)}k`;
+  return `${Math.round(n * 10) / 10}`;
+}
+
+// "Quota 12.3k/50k · 34 images left · valid until 2026-11-30" — plain text,
+// built from server-provided numbers only.
+export function licenseQuotaText(summary) {
+  const s = summary || {};
+  const q = s.quotas || {};
+  const parts = [];
+  if (Number.isFinite(q.unified_limit) && q.unified_limit > 0) {
+    const used = Number.isFinite(q.unified_used) ? q.unified_used : Math.max(0, q.unified_limit - (q.remaining_unified || 0));
+    parts.push(`Quota ${shortNumber(used)}/${shortNumber(q.unified_limit)}`);
+  } else if (Number.isFinite(q.remaining_unified)) {
+    parts.push(`Quota ${shortNumber(q.remaining_unified)} left`);
+  }
+  if (Number.isFinite(q.remaining_images) && q.remaining_images > 0) parts.push(`${shortNumber(q.remaining_images)} images left`);
+  if (Number.isFinite(q.expansion_pack_remaining) && q.expansion_pack_remaining > 0) parts.push(`+${shortNumber(q.expansion_pack_remaining)} bonus`);
+  if (s.expires_at) parts.push(`until ${String(s.expires_at).slice(0, 10)}`);
+  else if (s.status) parts.push(String(s.status));
+  return parts.join(' · ');
+}
+
 // Incremental parser for text/event-stream. Returns the parsed events and the unfinished remainder.
 export function parseSseChunk(buffer, chunk) {
   const parts = (buffer + chunk).split('\n\n');
@@ -212,11 +259,13 @@ function connectPane() {
   const keyInput = h('input', { class: 'hub-input', type: 'password', autocomplete: 'off', spellcheck: 'false', placeholder: 'Paste your API key', 'aria-label': 'API key' });
   const urlInput = h('input', { class: 'hub-input', type: 'text', placeholder: 'http://host:port/v1', 'aria-label': 'Base URL' });
   const urlRow = h('div', { class: 'hub-row hidden' }, h('label', {}, 'Base URL (OpenAI-compatible)'), urlInput);
-  const keyRow = h('div', { class: 'hub-row' }, h('label', {}, 'API key'), keyInput);
+  const keyLabel = h('label', {}, 'API key');
+  const keyRow = h('div', { class: 'hub-row' }, keyLabel, keyInput);
   const keyLink = h('a', { href: '#', target: '_blank', rel: 'noopener noreferrer', class: 'hub-link hidden' }, 'Get a key');
   const note = h('div', { class: 'hub-note' });
   const fetchBtn = h('button', { class: 'hub-btn primary', type: 'button' }, 'Fetch models');
   const status = h('div', { class: 'hub-status', role: 'status' });
+  const chatboxBox = h('div', { class: 'hidden', dataset: { pane: 'chatbox-license' } });
   const search = h('input', { class: 'hub-input', type: 'search', placeholder: 'Search models', 'aria-label': 'Search models' });
   const freeOnly = h('input', { type: 'checkbox', 'aria-label': 'Free only' });
   const freeLabel = h('label', { class: 'hidden' }, freeOnly, ' Free only');
@@ -228,12 +277,79 @@ function connectPane() {
   const addPool = h('input', { type: 'checkbox', checked: true, 'aria-label': 'Add to Auto pool' });
   const connectBtn = h('button', { class: 'hub-btn primary', type: 'button', disabled: true }, 'Connect');
   const result = h('div', { class: 'hub-status', role: 'status' });
+  const unsupportedNote = h('div', { class: 'hub-note hidden' });
   const modelsBox = h('div', { class: 'hidden' },
-    h('div', { class: 'hub-inline' }, search, freeLabel, selShown, selFree, selNone, count), listBox,
+    h('div', { class: 'hub-inline' }, search, freeLabel, selShown, selFree, selNone, count), unsupportedNote, listBox,
     h('div', { class: 'hub-inline' }, h('label', {}, addPool, ' Also add to the Auto pool'), connectBtn));
 
   const say = (el, text, cls = '') => { el.textContent = text; el.className = `hub-status ${cls}`.trim(); };
   let fetchGeneration = 0;
+  let chatboxStatus = null;
+
+  // Chatbox AI is subscription-backed: show plan/quota/expiry and a way to
+  // unlink, instead of leaving the user to guess what their license covers.
+  function renderChatboxStatus(data) {
+    chatboxStatus = data || { configured: false };
+    chatboxBox.textContent = '';
+    const configured = !!chatboxStatus.configured;
+    const summary = chatboxStatus.summary || {};
+    const quotaText = licenseQuotaText(summary);
+    const line = h('div', { class: 'hub-inline' },
+      badge(configured ? (summary.plan || chatboxStatus.plan || 'active') : 'not linked', configured ? 'free' : ''),
+      chatboxStatus.masked_key ? h('span', { class: 'hub-model-id' }, chatboxStatus.masked_key) : null,
+      quotaText ? h('span', { class: 'hub-note' }, quotaText) : null,
+      chatboxStatus.instance_name ? badge(chatboxStatus.instance_name, 'local') : null);
+    const actions = h('div', { class: 'hub-inline' });
+    if (configured) {
+      const refreshBtn = h('button', { class: 'hub-btn', type: 'button' }, 'Refresh usage');
+      refreshBtn.addEventListener('click', async () => {
+        refreshBtn.disabled = true;
+        say(status, 'Refreshing Chatbox AI usage…');
+        await refreshChatboxStatus(true);
+        refreshBtn.disabled = false;
+      });
+      const unlinkBtn = h('button', { class: 'hub-btn', type: 'button' }, 'Unlink license');
+      unlinkBtn.addEventListener('click', async () => {
+        if (typeof window.confirm === 'function' && !window.confirm('Unlink this Chatbox AI license from Odysseus?')) return;
+        unlinkBtn.disabled = true;
+        try {
+          const r = await api('/api/providers/chatbox/deactivate', { method: 'POST' });
+          renderChatboxStatus({ configured: false });
+          const disabled = r && r.disabled_endpoints ? ` ${r.disabled_endpoints} endpoint${r.disabled_endpoints === 1 ? '' : 's'} disabled.` : '';
+          say(status, r && r.warning
+            ? `License unlinked here, but Chatbox AI said: ${r.warning}${disabled}`
+            : `Chatbox AI license unlinked.${disabled}`, r && r.warning ? 'err' : 'ok');
+          notify('Chatbox AI license unlinked');
+        } catch (err) { say(status, err.message, 'err'); }
+        finally { unlinkBtn.disabled = false; }
+      });
+      actions.append(refreshBtn, unlinkBtn);
+    }
+    chatboxBox.append(
+      h('details', { class: 'hub-card', open: true },
+        h('summary', {}, configured ? (summary.name || 'Chatbox AI license') : 'Chatbox AI license'),
+        line,
+        chatboxStatus.detail_error && chatboxStatus.detail_error.message
+          ? h('div', { class: 'hub-note' }, chatboxStatus.detail_error.message) : null,
+        h('div', { class: 'hub-note' },
+          configured
+            ? 'One license backs this whole server. Claude models use Chatbox’s Anthropic gateway; Gemini and Responses models are listed but cannot be called from Odysseus yet.'
+            : 'Paste your license key from chatboxai.app, then Fetch models. Activation binds this server as one device.'),
+        actions));
+    chatboxBox.classList.remove('hidden');
+  }
+
+  async function refreshChatboxStatus(refresh = false) {
+    try {
+      const d = await api(`/api/providers/chatbox/status${refresh ? '?refresh=true' : ''}`);
+      renderChatboxStatus(d);
+      if (refresh) say(status, d.configured ? 'Chatbox AI usage refreshed.' : 'No Chatbox AI license is linked.', 'ok');
+      return d;
+    } catch (err) {
+      if (refresh) say(status, err.message, 'err');
+      return null;
+    }
+  }
 
   function applyPreset() {
     fetchGeneration += 1; // discard any in-flight response for the previous provider
@@ -249,10 +365,22 @@ function connectPane() {
     urlRow.classList.toggle('hidden', !showUrl);
     urlInput.value = p.local ? p.base_url : '';
     keyRow.classList.toggle('hidden', !p.needs_key && p.local);
-    keyInput.placeholder = p.needs_key ? 'Paste your API key' : 'API key (optional)';
+    const isChatbox = p.id === 'chatboxai';
+    keyLabel.textContent = isChatbox ? 'License key' : 'API key';
+    keyInput.placeholder = isChatbox
+      ? 'Paste your Chatbox AI license key'
+      : (p.needs_key ? 'Paste your API key' : 'API key (optional)');
     keyLink.classList.toggle('hidden', !p.key_url);
     if (p.key_url) keyLink.href = p.key_url;
     note.textContent = p.note || '';
+    chatboxBox.classList.toggle('hidden', !isChatbox);
+    if (isChatbox) {
+      renderChatboxStatus(chatboxStatus || { configured: false });
+      refreshChatboxStatus(false);
+    } else {
+      chatboxBox.textContent = '';
+      chatboxStatus = null;
+    }
     say(status, '');
   }
 
@@ -277,11 +405,14 @@ function connectPane() {
     const all = st.discovery ? st.discovery.models : [];
     const shown = filterModels(all, { query: search.value, freeOnly: freeOnly.checked });
     for (const m of shown.slice(0, 200)) {
-      const cb = h('input', { type: 'checkbox', checked: st.selected.has(m.id), 'aria-label': `Select ${m.id}` });
+      const supported = m.supported !== false;
+      const cb = h('input', { type: 'checkbox', checked: st.selected.has(m.id), disabled: !supported, 'aria-label': `Select ${m.id}` });
       cb.addEventListener('change', () => { if (cb.checked) st.selected.add(m.id); else st.selected.delete(m.id); updateCount(); });
       listBox.append(h('label', { class: 'hub-model', title: m.id }, cb, h('span', { class: 'hub-model-name' }, m.name || m.id),
         m.name && m.name !== m.id ? h('span', { class: 'hub-model-id' }, m.id) : null,
         m.free === true ? badge('free', 'free') : null, m.local ? badge('offline', 'local') : null,
+        m.api_style === 'anthropic' ? badge('claude') : null,
+        m.api_style === 'google' || m.api_style === 'openai-responses' ? badge('not supported') : null,
         m.vision ? badge('vision') : null, m.tools ? badge('tools') : null, m.reasoning ? badge('reasoning') : null,
         m.context_length ? badge(formatCtx(m.context_length)) : null));
     }
@@ -305,13 +436,31 @@ function connectPane() {
       // or allow them to be connected with a different provider's credentials.
       if (generation !== fetchGeneration || st.preset?.id !== preset.id || keyInput.value.trim() !== apiKey || urlInput.value.trim() !== baseUrl) return;
       st.discovery = d; st.selected = new Set();
-      // Small catalogs: tick everything. Big ones (OpenRouter): the user chooses.
-      if (d.models.length <= 15) d.models.forEach((m) => st.selected.add(m.id));
+      // Small catalogs: tick everything callable. Big ones (OpenRouter): the user chooses.
+      const supported = d.models.filter((m) => m.supported !== false);
+      if (supported.length <= 15) supported.forEach((m) => st.selected.add(m.id));
       freeLabel.classList.toggle('hidden', !d.free_count); selFree.classList.toggle('hidden', !d.free_count);
       freeOnly.checked = false; search.value = '';
+      const unsupportedCount = Array.isArray(d.unsupported)
+        ? d.unsupported.reduce((sum, item) => sum + ((item.model_ids || []).length), 0) : 0;
+      unsupportedNote.textContent = unsupportedCount
+        ? `${unsupportedCount} model${unsupportedCount === 1 ? '' : 's'} use a Chatbox gateway Odysseus cannot call yet (Gemini native / OpenAI Responses). They stay listed but cannot be selected.`
+        : '';
+      unsupportedNote.classList.toggle('hidden', !unsupportedCount);
       const extra = [];
       if (d.key_info && d.key_info.is_free_tier === true) extra.push('free-tier key');
       if (d.free_count) extra.push(`${d.free_count} free`);
+      if (d.key_info && d.key_info.provider === 'chatboxai') {
+        renderChatboxStatus({
+          configured: true,
+          masked_key: d.key_info.masked_key,
+          summary: d.key_info.summary || {},
+          instance_name: d.key_info.instance_name,
+          detail_error: d.key_info.license_detail_error,
+        });
+        const plan = d.key_info.summary && d.key_info.summary.plan;
+        if (plan) extra.push(`${plan} plan`);
+      }
       say(status, `${d.label}: ${d.count} model${d.count === 1 ? '' : 's'}${extra.length ? ` (${extra.join(', ')})` : ''}.`, 'ok');
       modelsBox.classList.remove('hidden'); renderList();
     } catch (err) {
@@ -329,20 +478,57 @@ function connectPane() {
     const addToPool = addPool.checked;
     connectBtn.disabled = true; say(result, 'Connecting…');
     try {
-      const form = new FormData();
-      form.append('name', p.label.replace(/\s*\(local\)$/, ''));
-      form.append('base_url', d.base_url);
-      form.append('api_key', apiKey);
-      form.append('endpoint_kind', d.local ? 'local' : (p.id === 'custom' ? 'auto' : 'api'));
-      form.append('pinned_models', JSON.stringify(ids));
-      form.append('require_models', 'false');
-      const ep = await api('/api/model-endpoints', { method: 'POST', form });
-      let msg = `Connected ${p.label}: ${ids.length} model${ids.length === 1 ? '' : 's'} added to the model picker.`;
+      const groups = p.id === 'chatboxai' ? connectGroups(d, ids) : [];
+      if (p.id === 'chatboxai' && !groups.length) {
+        say(result, 'Those models use a gateway Odysseus does not support yet. Pick at least one OpenAI or Claude model.', 'err');
+        return;
+      }
+      const created = [];
+      if (groups.length) {
+        // One endpoint per gateway protocol. The generic save route probes an
+        // "api" endpoint; skip that (Chatbox's /models is not a catalog) and
+        // rely on the pinned catalog fetched above.
+        for (const g of groups) {
+          const form = new FormData();
+          form.append('name', g.api_style === 'anthropic' ? `${p.label} · Claude` : p.label);
+          form.append('base_url', g.base_url);
+          form.append('api_key', apiKey);
+          form.append('endpoint_kind', 'auto');
+          form.append('skip_probe', 'true');
+          form.append('model_refresh_mode', 'manual');
+          form.append('pinned_models', JSON.stringify(g.model_ids));
+          form.append('require_models', 'false');
+          const ep = await api('/api/model-endpoints', { method: 'POST', form });
+          created.push({ ep, ids: g.model_ids });
+        }
+      } else {
+        const form = new FormData();
+        form.append('name', p.label.replace(/\s*\(local\)$/, ''));
+        form.append('base_url', d.base_url);
+        form.append('api_key', apiKey);
+        form.append('endpoint_kind', d.local ? 'local' : (p.id === 'custom' ? 'auto' : 'api'));
+        form.append('pinned_models', JSON.stringify(ids));
+        form.append('require_models', 'false');
+        const ep = await api('/api/model-endpoints', { method: 'POST', form });
+        created.push({ ep, ids });
+      }
+      const modelCount = created.reduce((sum, c) => sum + c.ids.length, 0);
+      let msg = created.length === 1
+        ? `Connected ${p.label}: ${modelCount} model${modelCount === 1 ? '' : 's'} added to the model picker.`
+        : `Connected ${p.label}: ${modelCount} models across ${created.length} endpoints (Claude uses the Anthropic gateway).`;
       if (addToPool) {
         const cur = await poolStore.load();
-        const merged = mergePool(cur.pool, toPoolEntries(ep.id, d.models, ids), cur.max_pool || 60);
-        await poolStore.save(merged.pool, cur.settings);
-        msg += ` ${merged.added} added to the Auto pool${merged.skipped ? ` (${merged.skipped} skipped: pool is full)` : ''}.`;
+        let pool = cur.pool;
+        let added = 0;
+        let skipped = 0;
+        for (const c of created) {
+          const merged = mergePool(pool, toPoolEntries(c.ep.id, d.models, c.ids), cur.max_pool || 60);
+          pool = merged.pool;
+          added += merged.added;
+          skipped += merged.skipped;
+        }
+        await poolStore.save(pool, cur.settings);
+        msg += ` ${added} added to the Auto pool${skipped ? ` (${skipped} skipped: pool is full)` : ''}.`;
       }
       if (generation === fetchGeneration && st.preset?.id === p.id && keyInput.value.trim() === apiKey) {
         keyInput.value = '';   // the key now lives, encrypted, on the server only
@@ -385,15 +571,15 @@ function connectPane() {
   keyInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') fetchModels(); });
   search.addEventListener('input', renderList);
   freeOnly.addEventListener('change', renderList);
-  selShown.addEventListener('click', () => { filterModels(st.discovery?.models, { query: search.value, freeOnly: freeOnly.checked }).slice(0, 200).forEach((m) => st.selected.add(m.id)); renderList(); });
-  selFree.addEventListener('click', () => { (st.discovery?.models || []).filter((m) => m.free === true).forEach((m) => st.selected.add(m.id)); renderList(); });
+  selShown.addEventListener('click', () => { filterModels(st.discovery?.models, { query: search.value, freeOnly: freeOnly.checked }).filter((m) => m.supported !== false).slice(0, 200).forEach((m) => st.selected.add(m.id)); renderList(); });
+  selFree.addEventListener('click', () => { (st.discovery?.models || []).filter((m) => m.supported !== false && m.free === true).forEach((m) => st.selected.add(m.id)); renderList(); });
   selNone.addEventListener('click', () => { st.selected.clear(); renderList(); });
   connectBtn.addEventListener('click', connect);
 
   const el = h('section', { class: 'hub-pane', dataset: { pane: 'connect' } },
     h('div', { class: 'hub-note' }, 'Pick a provider, paste its API key, and the available models are fetched for you. No URLs to copy.'),
     h('div', { class: 'hub-row' }, h('label', {}, 'Provider'), provSel), keyRow, urlRow,
-    h('div', { class: 'hub-inline' }, fetchBtn, keyLink), note, status, modelsBox, result);
+    h('div', { class: 'hub-inline' }, fetchBtn, keyLink), chatboxBox, note, status, modelsBox, result);
 
   return {
     el,

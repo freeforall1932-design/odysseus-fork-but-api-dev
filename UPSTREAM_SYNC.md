@@ -150,16 +150,24 @@ else means upstream content was dropped or downstream content leaked.
 | `static/index.html` | One line: `<script type="module" src="/static/js/providerHub.js"></script>` after `settings.js`, before `assistant.js`. `app.js` must stay last. | Take upstream's script tags (they carry `?v=` cache-busters), re-insert the line. |
 | `static/sw.js` | `'/static/js/providerHub.js'` in `PRECACHE` after the `settings.js` entry; `CACHE_NAME` bumped. | Take upstream's `PRECACHE`, re-add the entry. Take upstream's `CACHE_NAME` and bump it again (for example append `-providerhub`): the file's own rule is "bump whenever the precache list changes". |
 | `static/js/chat.js` | (a) `detectWorkspaceAgentIntent()` helper near the top, a mirror of upstream's Agent-mode heuristic; (b) the Auto pre-send block (~25 lines ending in `window.odysseusAuto.beforeSend(...)`) immediately before `const messageInput = el('message');`. | Keep upstream's Agent-mode block (from `const _messageText = String(msg \|\| '');` through the `workspaceAgentIntent` assignment) byte-for-byte. If upstream changed any regex there, copy the new literals into the helper. Never write the literal text `const workspaceAgentIntent` in a comment: upstream's guard test reads the first line that contains it. Enforced by `tests/test_chat_route_tool_policy.py::test_frontend_generic_web_prose_does_not_grant_shell_authority` (upstream) and `tests/test_provider_and_auto_routes.py::test_auto_hint_mirrors_agent_mode_workspace_heuristic` (downstream, fails until helper and block match). |
-| `routes/model_routes.py` | `"host.docker.internal"` added to `_LOCAL_HOSTS`. | Re-add it to upstream's set. |
+| `routes/model_routes.py` | `"host.docker.internal"` added to `_LOCAL_HOSTS`; the Anthropic probe uses `_safe_build_headers(api_key, base)` so Chatbox's `Instance-Id` reaches `/v1/models`; first-endpoint default assignment falls back to a pinned model when the probe returned none. | Re-add all three hooks. |
+| `src/chatbox_ai.py`, `docs/CHATBOX_AI.md`, `tests/test_chatbox_ai.py`, `tests/test_chatbox_license_store.py`, `tests/test_chatbox_routing.py`, `tests/test_provider_chatbox_routes.py`, `tests/test_provider_hub_chatbox_js.py` | Downstream-only **Chatbox AI provider**: license activation, encrypted license storage, model catalog, gateway routing and tests. | Cannot conflict unless upstream adds a file at the same path (add/add). Keep ours; they import upstream modules (`core.database`, `src.provider_presets`, `static/js/providerHub.js`). |
 | `tests/test_model_routes.py` | `TestClassifyEndpoint::test_docker_host_gateway_is_local`. | Keep the test. |
 | `tests/test_tls_overrides_scope.py` | `routes/provider_routes.py` added to `ALLOWED_CALLERS` (it calls `llm_verify()`); docstring says "known entry points". | Re-add the entry. |
 | `tests/test_docs_no_orphan_images.py` | `"providers-auto-council.md"` in `PUBLIC_GUIDES`. | Re-add. |
-| `README.md` | One nav link to `website/providers-auto-council.md`. | Re-add the link in upstream's nav line. |
-| `core/database.py` | `from sqlalchemy.orm import declarative_base, declared_attr` (upstream still uses the deprecated `sqlalchemy.ext.declarative`). | Keep ours; if upstream fixes it, take upstream's. |
+| `README.md` | Nav links to `website/providers-auto-council.md` and `docs/CHATBOX_AI.md`, plus the Chatbox AI feature bullet. | Re-add the links and bullet in upstream's nav/features. |
+| `core/database.py` | `from sqlalchemy.orm import declarative_base, declared_attr` (upstream still uses the deprecated `sqlalchemy.ext.declarative`) plus the downstream-only `ChatboxAILicense` table (encrypted license key/instance/detail; created by `create_all`). | Keep ours; if upstream fixes the import, take upstream's. Keep `ChatboxAILicense` and do not let a table migration drop it. |
 | `routes/skills_routes.py` | `body.model_dump(exclude_none=True)` instead of `body.dict(...)`. | Same. |
 | `.gitleaks.toml` | Upstream's file plus a second `[[allowlists]]` block for the historical `sk-LEAKTEST-123456` literal. | Keep every upstream block and the downstream block appended. Both are needed: upstream's for `THIRD_PARTY_PROVENANCE.json`, ours because `gitleaks git` scans history. |
 | `audit.md`, `SESSION_HANDOFF.md`, `WORKLIST.md`, `UPSTREAM_SYNC.md` | Downstream documents. | Cannot conflict. |
 | `.github/workflows/upstream-sync.yml`, `.github/scripts/upstream_sync.py`, `tests/test_upstream_sync_script.py` | The sync automation (see "Automation"). | Downstream-only. If upstream adds a file at the same path, keep ours and rename only if the two really collide. The script's symbol and integration-point lists mirror this table and the Verification section: update them together. |
+
+Chatbox AI also touches upstream-owned routing files. Take upstream's version and re-apply only these hooks:
+`src/endpoint_resolver.py` (`_anthropic_api_root` strips the Chatbox Anthropic gateway's `/v1`;
+`build_headers` merges `_chatbox_extra_headers`), `src/llm_core.py` (`_detect_provider` maps
+`/gateway/anthropic/` to `"anthropic"`; `_provider_label` names Chatbox AI), and
+`static/js/providerHub.js` (license card, unsupported badges, per-gateway connect). The full list and
+wire contract are in `docs/CHATBOX_AI.md`.
 
 Upstream integration points the downstream UI depends on (check these if
 upstream reworked the model picker or settings):

@@ -20,9 +20,19 @@ Open it from the model picker: **API key** button (Connect), **Pool** and **Coun
 Saving goes through the existing `POST /api/model-endpoints` with the ticked models as `pinned_models`, so key
 encryption, the picker and Docker loopback handling behave exactly as when an endpoint is added by hand.
 
-Presets: OpenRouter (free models detected from pricing; key checked with `GET /key` first), Google Gemini, OpenAI,
-Anthropic, Groq, Mistral, DeepSeek, Together, Cerebras, NVIDIA NIM, xAI, Hugging Face, Ollama, LM Studio, and a custom
-OpenAI-compatible URL. A cloud preset always talks to its own fixed address; only local/custom may override it.
+Presets: OpenRouter (free models detected from pricing; key checked with `GET /key` first), **Chatbox AI** (subscription
+license key from chatboxai.app; plan/quota shown in the dialog), Google Gemini, OpenAI, Anthropic, Groq, Mistral,
+DeepSeek, Together, Cerebras, NVIDIA NIM, xAI, Hugging Face, Ollama, LM Studio, and a custom OpenAI-compatible URL.
+A cloud preset always talks to its own fixed address; only local/custom may override it.
+
+### Chatbox AI
+
+Paste a Chatbox AI license key and Fetch models. Odysseus activates the key (one device per server), lists the plan's
+chat models and registers one endpoint per gateway protocol: **Chatbox AI** (OpenAI-compatible) and
+**Chatbox AI · Claude** (Anthropic Messages). Gemini-native and OpenAI-Responses catalog entries are shown but disabled
+because Odysseus does not implement those protocols yet. The license key is encrypted at rest, never returned to the
+browser, and `Instance-Id` rides along on gateway calls. **Unlink license** releases the seat and disables the matching
+endpoints. Details and the wire contract: [docs/CHATBOX_AI.md](../docs/CHATBOX_AI.md).
 
 ## Auto
 `PUT /api/auto/pool` stores the pool (max 60) and settings in the existing per-user prefs store.
@@ -60,4 +70,7 @@ because each later-round prompt carries everyone's answer.
 * Verification catches what the reviewing models know. It does not check citations; check references yourself.
 
 ## Tests
-`tests/test_provider_presets.py`, `test_auto_router.py`, `test_council.py`, `test_provider_and_auto_routes.py` (175 tests), plus `TestClassifyEndpoint` in `test_model_routes.py` (25 tests; 200 total, no network).
+`tests/test_provider_presets.py`, `test_auto_router.py`, `test_council.py`, `test_provider_and_auto_routes.py`, plus
+`TestClassifyEndpoint` in `test_model_routes.py`. Chatbox AI adds `test_chatbox_ai.py`, `test_chatbox_routing.py`,
+`test_provider_chatbox_routes.py`, `test_chatbox_license_store.py` and the Node-backed `test_provider_hub_chatbox_js.py`
+(all mocked; no network).

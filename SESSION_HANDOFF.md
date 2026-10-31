@@ -1,5 +1,56 @@
 # Session Handoff
 
+## Latest session — Chatbox AI provider (2026-10-31)
+
+Branch `arena/d5cf1ff7-odysseus-fork-but-api-dev` adds a first-class **Chatbox AI** provider
+(a chatboxai.app subscription license key), matching the Chatbox desktop client's wire contract
+but using only Odysseus's existing endpoint/encryption layers.
+
+**Implemented**
+
+- `src/chatbox_ai.py` — license activate/validate/deactivate/detail, model catalog (model-list with
+  manifest fallback), per-gateway variants, plan/quota summary, encrypted storage helpers,
+  `Instance-Id` header lookup (5-minute process cache, never network I/O in header building).
+- `provider_presets.py` — `chatboxai` preset, `api_style`/`supported` on `ModelCard`, discovery adapter
+  that activates + lists + groups models. Gemini-native and OpenAI-Responses models are catalogued but
+  unsupported (Odysseus implements neither protocol yet).
+- `routes/provider_routes.py` — chatbox branch on `POST /api/providers/models` (persists license, strips
+  `instance_id`/`license_detail` from the response) plus admin-only
+  `POST /api/providers/chatbox/activate`, `GET /api/providers/chatbox/status?refresh=`, and
+  `POST /api/providers/chatbox/deactivate` (releases seat, disables matching endpoints, deletes row).
+- `core/database.py` — `ChatboxAILicense` (`EncryptedText` key/instance/detail; SHA-256 fingerprint; one
+  active row per owner). Created by `create_all`; no ALTER migration needed.
+- `src/llm_core.py` / `src/endpoint_resolver.py` — detect Chatbox's `/gateway/anthropic/` as Anthropic,
+  build `/messages` vs `/chat/completions` correctly, send `x-api-key` vs Bearer, attach `Instance-Id`,
+  label the provider "Chatbox AI".
+- `static/js/providerHub.js` — license card with plan/quota/expiry, refresh + unlink, disabled
+  "not supported" badges, and per-gateway connect (one endpoint for OpenAI models, one for Claude).
+- Docs: `docs/CHATBOX_AI.md`, `website/providers-auto-council.md`, README, ACKNOWLEDGMENTS.
+
+**Validation**
+
+- `234 passed` across provider presets, provider routes, endpoint URL/header/detection suites.
+- `32 passed` for the new Chatbox client/routing/route suites, `19 passed` for storage + JS helpers.
+- `node --check static/js/providerHub.js` clean.
+- All Chatbox HTTP is mocked: the suite proves contract shape, key handling, routing and storage, **not**
+  that a real license works. A live check needs a key and egress to `api.chatboxai.app` (blocked in the
+  sandbox). Report this honestly before claiming it works end-to-end.
+
+**Deliberately not done**
+
+- No first-party Odysseus-hosted API (the user clarified they want Chatbox AI itself, not a new gateway).
+- No Gemini-native / OpenAI-Responses chat adapters; no image/embedding/RAG/account-login Chatbox features.
+- No Electron/Android shell work (user deferred until after research). Odysseus is a local web server;
+  the portable Windows and macOS launchers already open the local URL in the browser.
+
+**Next likely steps**
+
+1. Live-key smoke test on a machine that can reach `api.chatboxai.app`; verify `Instance-Id` is accepted and
+   quota is attributed.
+2. If Claude calls fail because the gateway expects a different beta header, capture the response and add it
+   in `build_headers` (do not guess).
+3. Decide whether to add a Gemini-native adapter (larger change) or hide those models entirely.
+
 ## Upstream sync (read this first)
 
 - This repository shares git history with upstream since merge commit `0f5c3c94` (PR #10, 2026-10-14, upstream `dev` @ `86b886c6`).

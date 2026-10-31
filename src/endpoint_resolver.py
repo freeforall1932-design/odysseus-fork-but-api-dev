@@ -362,6 +362,15 @@ def _anthropic_api_root(base: str) -> str:
     base = (base or "").strip().rstrip("/")
     if _host_match(base, "anthropic.com") and base.endswith("/v1"):
         return base[:-3].rstrip("/")
+    try:
+        from src.chatbox_ai import is_chatbox_anthropic_url
+
+        # Chatbox's Anthropic gateway mirrors Anthropic's /v1 shape. Strip /v1
+        # here so build_chat_url/_normalize_anthropic_url re-add exactly one.
+        if is_chatbox_anthropic_url(base) and base.endswith("/v1"):
+            return base[:-3].rstrip("/")
+    except Exception:  # pragma: no cover - import failure must not break routing
+        pass
     return base
 
 
@@ -412,14 +421,30 @@ def build_models_url(base: str) -> Optional[str]:
     return _append_endpoint_path(base, "/models")
 
 
+def _chatbox_extra_headers(api_key: Optional[str], base: str) -> Dict[str, str]:
+    """Chatbox AI gateway headers (Instance-Id) for a stored license, if any.
+
+    Cheap and failure-proof: the lookup is process-cached and *never* performs
+    network I/O, so header building cannot slow down or break a chat turn.
+    """
+    try:
+        from src.chatbox_ai import auth_headers
+
+        return auth_headers(api_key, base)
+    except Exception:  # pragma: no cover - never break request building
+        return {}
+
+
 def build_headers(api_key: Optional[str], base: str) -> Dict[str, str]:
     """Build auth headers for an endpoint."""
     provider = _detect_provider(base)
     headers: Dict[str, str] = {}
+    extra = _chatbox_extra_headers(api_key, base)
     if provider == "anthropic":
         if api_key:
             headers["x-api-key"] = api_key
         headers["anthropic-version"] = "2023-06-01"
+        headers.update(extra)
         return headers
     if provider == "copilot":
         from src.copilot import copilot_headers
@@ -434,6 +459,7 @@ def build_headers(api_key: Optional[str], base: str) -> Dict[str, str]:
         headers.setdefault("X-OpenRouter-Title", "Odysseus")
     if _is_kimi_code_url(base):
         headers.setdefault("User-Agent", KIMI_CODE_USER_AGENT)
+    headers.update(extra)
     return headers
 
 
