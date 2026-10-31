@@ -96,3 +96,26 @@ def test_license_quota_text_is_plain_and_hides_missing_numbers(tmp_path):
         console.log(JSON.stringify(licenseQuotaText({})));
     """))
     assert empty == ""
+
+
+@pytest.mark.skipif(not _HAS_NODE, reason="node binary not on PATH")
+def test_pool_key_label_summarises_health(tmp_path):
+    module = tmp_path / "providerHub.mjs"
+    module.write_text(_SRC.read_text(encoding="utf-8"), encoding="utf-8")
+    script = textwrap.dedent(
+        f"""
+        import {{ poolKeyLabel }} from {json.dumps(module.as_uri())};
+        console.log(JSON.stringify({{
+          primary: poolKeyLabel({{ masked: 'sk-abc…1234', label: 'primary', persisted: false }}),
+          cooling: poolKeyLabel({{ masked: 'sk-d…9999', label: 'backup', persisted: true,
+                                   cooling_down: true, cooldown_seconds: 42, last_status: 429 }}),
+          healthy: poolKeyLabel({{ masked: 'sk-e…8888', persisted: true, successes: 7 }}),
+          failing: poolKeyLabel({{ masked: 'sk-f…7777', persisted: true, failures: 1 }}),
+        }}));
+        """
+    )
+    out = _run(script)
+    assert out["primary"] == "sk-abc…1234 · primary"
+    assert out["cooling"] == "sk-d…9999 · backup · cooling 42s (429)"
+    assert out["healthy"] == "sk-e…8888 · ok"
+    assert out["failing"] == "sk-f…7777 · 1 failure"

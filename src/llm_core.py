@@ -2653,6 +2653,51 @@ async def llm_call_async_with_route_fallback(
     raise HTTPException(503, "All fallback candidates failed")
 
 
+def _rotate_nonstream_key(headers, url, response, tried):
+    """Next credential's headers after a key-scoped HTTP failure, or None."""
+    try:
+        from src import key_pool
+    except Exception:  # pragma: no cover
+        return None
+    body = ""
+    retry_after = None
+    try:
+        body = response.text or ""
+    except Exception:
+        body = ""
+    try:
+        retry_after = key_pool.parse_retry_after(
+            (response.headers or {}).get("retry-after")
+            if response is not None else None
+        )
+    except Exception:
+        retry_after = None
+    try:
+        current = key_pool.current_key(headers)
+        rotated = key_pool.rotate_headers(
+            headers, url, status=response.status_code, body=body,
+            retry_after=retry_after, tried=tried,
+        )
+    except Exception:  # pragma: no cover
+        logger.debug("non-stream key rotation failed", exc_info=True)
+        return None
+    if rotated and current:
+        tried.append(current)
+    return rotated
+
+
+def _note_key_success(headers, url):
+    try:
+        from src import key_pool
+
+        current = key_pool.current_key(headers)
+        endpoint_id = key_pool.endpoint_for_key(current) if current else None
+        if endpoint_id:
+            key_pool.record_success(endpoint_id, current)
+    except Exception:  # pragma: no cover
+        logger.debug("key success accounting failed", exc_info=True)
+
+
 async def llm_call_async(
     url: str,
     model: str,
@@ -2831,6 +2876,7 @@ async def llm_call_async(
         raise HTTPException(503, f"Upstream {_host_key(target_url)} marked unreachable (cooldown active)")
 
     call_timeout = _call_timeout(timeout)
+    tried_keys: List[str] = []
     attempt = 0
     while attempt < max_retries:
         attempt += 1
@@ -2847,12 +2893,21 @@ async def llm_call_async(
                     f"LLM async call to {target_url} failed in {duration:.2f}s "
                     f"(attempt {attempt}): HTTP {r.status_code} {friendly}"
                 )
+                # A rate-limited or exhausted key is not a reason to stop: the
+                # pool hands the same request to the next key of this endpoint.
+                rotated = _rotate_nonstream_key(
+                    h, target_url, r, tried_keys,
+                )
+                if rotated is not None and attempt < max_retries:
+                    h = rotated
+                    continue
                 if r.status_code in (429, 502, 503, 504) and attempt < max_retries:
                     await asyncio.sleep(LLMConfig.RETRY_DELAY)
                     continue
                 raise HTTPException(r.status_code, friendly)
             logger.info(f"LLM async call to {target_url} succeeded in {duration:.2f}s (attempt {attempt})")
             _clear_host_dead(target_url)
+            _note_key_success(h, target_url)
             data = r.json()
             if isinstance(data, dict) and data.get("error"):
                 provider_error = data["error"]
@@ -2983,30 +3038,106 @@ def _stream_target_url(url: str) -> str:
     return _normalize_openai_chat_url(url)
 
 
+def _stream_error_payload(chunk: str):
+    """Status + message of an ``event: error`` SSE chunk, if it is one."""
+    if not isinstance(chunk, str) or not chunk.startswith("event: error"):
+        return None, ""
+    for line in chunk.splitlines():
+        if not line.startswith("data:"):
+            continue
+        try:
+            payload = json.loads(line[5:].strip())
+        except (TypeError, ValueError):
+            return None, ""
+        if not isinstance(payload, dict):
+            return None, ""
+        raw_status = payload.get("status") or payload.get("status_code") or payload.get("http_status")
+        try:
+            status = int(raw_status) if raw_status is not None else None
+        except (TypeError, ValueError):
+            status = None
+        message = str(payload.get("error") or payload.get("text") or "")
+        return status, message
+    return None, ""
+
+
 async def stream_llm(url: str, model: str, messages: List[Dict], temperature: float = LLMConfig.DEFAULT_TEMPERATURE,
                      max_tokens: int = LLMConfig.DEFAULT_MAX_TOKENS, headers: Optional[Dict] = None,
                      timeout: int = LLMConfig.STREAM_TIMEOUT, prompt_type: Optional[str] = None,
                      tools: Optional[List[Dict]] = None, session_id: Optional[str] = None,
                      tool_choice_none: bool = False, workload: str = "foreground",
                      thinking_mode: Optional[str] = None, reasoning_effort: Optional[str] = None):
+    """Stream one completion, rotating the API key if the provider rejects it.
+
+    The key pool swaps the credential and re-runs the request only while nothing
+    has been shown to the user yet (no text, no tool calls). Once tokens are on
+    screen a silent retry would duplicate or garble the answer, so the error goes
+    out as usual and the existing fallback policy decides what happens next.
+    """
     target_url = _stream_target_url(url)
-    async with _local_model_slot(target_url, model, workload):
-        async for chunk in _stream_llm_inner(
+    active_headers = dict(headers) if headers else headers
+    tried_keys: List[str] = []
+    while True:
+        emitted = False
+        rotated = False
+        async with _local_model_slot(target_url, model, workload):
+            async for chunk in _stream_llm_inner(
+                url,
+                model,
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                headers=active_headers,
+                timeout=timeout,
+                prompt_type=prompt_type,
+                tools=tools,
+                session_id=session_id,
+                tool_choice_none=tool_choice_none,
+                thinking_mode=thinking_mode,
+                reasoning_effort=reasoning_effort,
+            ):
+                if not emitted:
+                    status, message = _stream_error_payload(chunk)
+                    if status is not None:
+                        rotated_headers = _rotate_stream_key(
+                            active_headers, url, status, message, tried_keys,
+                        )
+                        if rotated_headers is not None:
+                            active_headers = rotated_headers
+                            rotated = True
+                            break
+                if not emitted and chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
+                    body = chunk[6:].strip()
+                    if '"delta"' in body or '"tool_calls"' in body or '"type": "tool' in body:
+                        emitted = True
+                yield chunk
+        if not rotated:
+            return
+
+
+def _rotate_stream_key(active_headers, url, status, message, tried_keys):
+    """New headers for the same request after a key-scoped stream failure."""
+    try:
+        from src import key_pool
+
+        current = key_pool.current_key(active_headers)
+        rotated = key_pool.rotate_headers(
+            active_headers,
             url,
-            model,
-            messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            headers=headers,
-            timeout=timeout,
-            prompt_type=prompt_type,
-            tools=tools,
-            session_id=session_id,
-            tool_choice_none=tool_choice_none,
-            thinking_mode=thinking_mode,
-            reasoning_effort=reasoning_effort,
-        ):
-            yield chunk
+            status=status,
+            body=message,
+            tried=tried_keys,
+        )
+    except Exception:  # pragma: no cover - rotation must never break streaming
+        logger.debug("stream key rotation failed", exc_info=True)
+        return None
+    if not rotated:
+        return None
+    if current:
+        tried_keys.append(current)
+    logger.info("key pool: retried stream on a fresh key (status=%s)", status)
+    return rotated
+
 
 
 async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperature: float = LLMConfig.DEFAULT_TEMPERATURE,

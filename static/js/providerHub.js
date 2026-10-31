@@ -114,6 +114,19 @@ export function licenseQuotaText(summary) {
   return parts.join(' · ');
 }
 
+// One line per pooled credential: "sk-abc…1234 · backup · cooling 42s (429)".
+// Health text is built only from server numbers, never from error bodies.
+export function poolKeyLabel(key) {
+  if (!key) return '';
+  const parts = [key.masked || ''];
+  if (key.label && key.label !== 'primary') parts.push(key.label);
+  if (key.cooling_down) parts.push(`cooling ${Number(key.cooldown_seconds || 0)}s${key.last_status ? ` (${key.last_status})` : ''}`);
+  else if (key.successes) parts.push('ok');
+  else if (key.failures) parts.push(`${key.failures} failure${key.failures === 1 ? '' : 's'}`);
+  if (!key.persisted) parts.push('primary');
+  return parts.filter(Boolean).join(' · ');
+}
+
 // Incremental parser for text/event-stream. Returns the parsed events and the unfinished remainder.
 export function parseSseChunk(buffer, chunk) {
   const parts = (buffer + chunk).split('\n\n');
@@ -576,15 +589,114 @@ function connectPane() {
   selNone.addEventListener('click', () => { st.selected.clear(); renderList(); });
   connectBtn.addEventListener('click', connect);
 
+  // --------------------------------------------------------------- key pool
+  // One provider, several keys. The server rotates on 401/402/403/429, so a
+  // quota-exhausted key never ends a chat; this panel is where the extra keys
+  // are added and where the cooldowns are visible.
+  const keysBox = h('details', { class: 'hub-card' },
+    h('summary', {}, 'API key rotation (pool)'));
+  const keysEpSel = h('select', { class: 'hub-input', 'aria-label': 'Endpoint for key pool' });
+  const keysArea = h('div', {});
+  const keysStatus = h('div', { class: 'hub-status', role: 'status' });
+  const keysInput = h('input', { class: 'hub-input', type: 'password', autocomplete: 'off', spellcheck: 'false', placeholder: 'Paste the extra API key', 'aria-label': 'Extra API key' });
+  const keysLabel = h('input', { class: 'hub-input', type: 'text', placeholder: 'Label (optional)', 'aria-label': 'Key label' });
+  const keysAddBtn = h('button', { class: 'hub-btn primary', type: 'button' }, 'Add key');
+  const keysResetBtn = h('button', { class: 'hub-btn', type: 'button' }, 'Reset cooldowns');
+  let keyEndpoints = [];
+
+  function sayKeys(text, cls = '') { keysStatus.textContent = text; keysStatus.className = `hub-status ${cls}`.trim(); }
+
+  function renderPoolStatus(data) {
+    keysArea.textContent = '';
+    const keys = (data && data.keys) || [];
+    if (!keys.length) {
+      keysArea.append(h('div', { class: 'hub-note' }, 'This endpoint has no key yet.'));
+      return;
+    }
+    keysArea.append(h('div', { class: 'hub-note' },
+      `${data.healthy_count} of ${data.key_count} usable${data.rotation_ready ? '' : ' — add a second key to enable rotation'}.`));
+    for (const key of keys) {
+      const row = h('div', { class: 'hub-model' },
+        h('span', {}, poolKeyLabel(key)),
+        key.persisted ? h('button', {
+          class: 'hub-btn', type: 'button',
+          onclick: async () => {
+            if (!window.confirm('Remove this key from the pool?')) return;
+            try { await api(`/api/providers/keys/${encodeURIComponent(key.id)}`, { method: 'DELETE' }); await loadPoolStatus(); }
+            catch (err) { sayKeys(err.message, 'err'); }
+          },
+        }, 'Remove') : null);
+      keysArea.append(row);
+    }
+  }
+
+  async function loadPoolStatus() {
+    const endpointId = keysEpSel.value;
+    if (!endpointId) { keysArea.textContent = ''; return; }
+    try { renderPoolStatus(await api(`/api/providers/keys?endpoint_id=${encodeURIComponent(endpointId)}`)); }
+    catch (err) { sayKeys(err.message, 'err'); }
+  }
+
+  async function loadPoolEndpoints() {
+    try {
+      const listing = await api('/api/model-endpoints');
+      const rows = Array.isArray(listing) ? listing : (listing.endpoints || []);
+      keyEndpoints = rows.filter((e) => e && e.id);
+      const previous = keysEpSel.value;
+      keysEpSel.textContent = '';
+      for (const ep of keyEndpoints) keysEpSel.append(h('option', { value: ep.id }, ep.name || ep.id));
+      if (previous && keyEndpoints.some((e) => e.id === previous)) keysEpSel.value = previous;
+      await loadPoolStatus();
+    } catch (err) { sayKeys(`Could not load endpoints: ${err.message}`, 'err'); }
+  }
+
+  keysEpSel.addEventListener('change', () => { sayKeys(''); loadPoolStatus(); });
+  keysAddBtn.addEventListener('click', async () => {
+    const endpointId = keysEpSel.value;
+    const apiKey = keysInput.value.trim();
+    if (!endpointId) { sayKeys('Connect a provider first.', 'err'); return; }
+    if (!apiKey) { sayKeys('Paste the extra key first.', 'err'); return; }
+    keysAddBtn.disabled = true;
+    try {
+      const d = await api('/api/providers/keys', {
+        method: 'POST',
+        json: { endpoint_id: endpointId, api_key: apiKey, label: keysLabel.value.trim() },
+      });
+      keysInput.value = ''; keysLabel.value = '';
+      renderPoolStatus(d.pool);
+      sayKeys('Key added. Requests rotate to it when the first one is rate-limited.', 'ok');
+    } catch (err) { sayKeys(err.message, 'err'); }
+    finally { keysAddBtn.disabled = false; }
+  });
+  keysResetBtn.addEventListener('click', async () => {
+    const endpointId = keysEpSel.value;
+    if (!endpointId) return;
+    try {
+      await api(`/api/providers/keys/reset?endpoint_id=${encodeURIComponent(endpointId)}`, { method: 'POST' });
+      await loadPoolStatus();
+      sayKeys('Cooldowns cleared.', 'ok');
+    } catch (err) { sayKeys(err.message, 'err'); }
+  });
+
+  keysBox.append(
+    h('div', { class: 'hub-note' }, 'Extra keys for one provider. When a key runs out of quota or hits a rate limit, Odysseus retries the same turn on the next key — the conversation, tools and memory stay exactly where they were.'),
+    h('div', { class: 'hub-row' }, h('label', {}, 'Provider endpoint'), keysEpSel),
+    keysArea,
+    h('div', { class: 'hub-row' }, h('label', {}, 'Additional key'), keysInput),
+    h('div', { class: 'hub-row' }, h('label', {}, 'Label'), keysLabel),
+    h('div', { class: 'hub-inline' }, keysAddBtn, keysResetBtn),
+    keysStatus);
+
   const el = h('section', { class: 'hub-pane', dataset: { pane: 'connect' } },
     h('div', { class: 'hub-note' }, 'Pick a provider, paste its API key, and the available models are fetched for you. No URLs to copy.'),
     h('div', { class: 'hub-row' }, h('label', {}, 'Provider'), provSel), keyRow, urlRow,
-    h('div', { class: 'hub-inline' }, fetchBtn, keyLink), chatboxBox, note, status, modelsBox, result);
+    h('div', { class: 'hub-inline' }, fetchBtn, keyLink), chatboxBox, note, status, modelsBox, result, keysBox);
 
   return {
     el,
     async onShow() {
       if (st.presets.length) return;
+      loadPoolEndpoints();
       try {
         st.presets = (await api('/api/providers/presets')).presets;
         provSel.textContent = '';

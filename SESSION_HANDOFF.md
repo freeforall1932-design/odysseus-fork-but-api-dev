@@ -61,6 +61,37 @@ but using only Odysseus's existing endpoint/encryption layers.
    in `build_headers` (do not guess).
 3. Decide whether to add a Gemini-native adapter (larger change) or hide those models entirely.
 
+## Latest session — key rotation (BYOR pool) and upstream sync (2026-10-31)
+
+**Upstream sync.** `source/dev` @ `516f046f` (191 commits) is merged into the branch as merge commit
+`19c52bc0`. Only `.gitleaks.toml` and `static/sw.js` conflicted; both resolved by the manifest rules
+(upstream allowlist kept + downstream historical fixture re-appended; upstream `CACHE_NAME`
+`odysseus-v1115-pr40-editor-precache` bumped to `...-providerhub`). Every Chatbox hook survived in the
+auto-merged upstream files. Gate: `upstream_sync.py --check-only` 27/27, 485 tests, app boots on
+`0.0.0.0:7011`, `/api/providers/*` and `/api/auto/pool` answer 401 (registered behind auth).
+**The mirror fork is 10 commits behind `odysseus-dev/dev`** and `gh repo sync` returns HTTP 403 from
+this sandbox — those ten commits are still outstanding; the owner must sync the fork.
+
+**Key pool (new).** One endpoint, many credentials, automatic rotation:
+
+- `core/database.py::ProviderKey` — encrypted `api_key`, SHA-256 `key_fingerprint`, `priority`,
+  `is_enabled`, endpoint FK. The endpoint's own `api_key` is implicitly the first pool member, so
+  nothing migrates.
+- `src/key_pool.py` — selection (priority → least-recently-used), cooldowns (`429` honors
+  `Retry-After` else 60 s, `402`/quota `403` 30 min, `401` 1 h, three provider-wide failures rest a key
+  30 s), rotation, header swap, masking, `describe_pool()`. Health is **process memory only** (no DB
+  write on the chat path); credentials are cached 15 s with invalidation on mutation.
+- `resolve_endpoint_runtime()` consults the pool, so chat, agent tools, skills, research, webhooks and
+  background tasks all rotate without knowing about it. `stream_llm()` retries a pre-first-token
+  `401/402/403/429` on the next key; `llm_call_async()` retries immediately instead of sleeping.
+  After output starts, the error is surfaced (a silent splice would duplicate text).
+- Routes `GET/POST/DELETE/PATCH /api/providers/keys*` (admin), and an "API key rotation (pool)" card in
+  the provider dialog (`static/js/providerHub.js`, `poolKeyLabel` exported for tests).
+- `docs/KEY_POOL.md` documents policy, storage and seams. 726 tests pass across the touched suites.
+
+**Not built yet** (user's next asks): multi-agent "team" orchestration (architect / implementer /
+reviewer roles with a shared handoff), and any cross-process health sharing.
+
 ## Upstream sync (read this first)
 
 - This repository shares git history with upstream since merge commit `0f5c3c94` (PR #10, 2026-10-14, upstream `dev` @ `86b886c6`).

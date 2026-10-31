@@ -173,7 +173,10 @@ def resolve_endpoint_runtime(ep, owner: Optional[str] = None) -> Tuple[str, Opti
 
     Static-key providers use ``ModelEndpoint.api_key``. Session-backed providers
     store refreshable credentials in ProviderAuthSession and must resolve a
-    current access token at call time.
+    current access token at call time. Endpoints with a key pool return the next
+    healthy credential, which is what makes rotation happen for every caller
+    (chat, agent tools, background tasks, research, webhooks) without each one
+    knowing about it.
     """
     base = _rewrite_docker_host_for_native_runtime(
         normalize_base(getattr(ep, "base_url", "") or "")
@@ -188,7 +191,27 @@ def resolve_endpoint_runtime(ep, owner: Optional[str] = None) -> Tuple[str, Opti
             normalize_base(creds.get("base_url") or base)
         )
         api_key = creds.get("api_key")
+    else:
+        pooled = _pooled_key(getattr(ep, "id", None))
+        if pooled:
+            api_key = pooled
     return base, api_key
+
+
+def _pooled_key(endpoint_id: Optional[str]) -> Optional[str]:
+    """Next healthy key from the endpoint's pool, or None to keep the primary.
+
+    Failure-proof: a broken pool must never stop a chat from starting.
+    """
+    if not endpoint_id:
+        return None
+    try:
+        from src.key_pool import pick_key
+
+        return pick_key(str(endpoint_id))
+    except Exception:  # pragma: no cover - pool must never break routing
+        logger.debug("key pool selection failed for %s", endpoint_id, exc_info=True)
+        return None
 
 
 # Cache for Tailscale hostname → IP resolution

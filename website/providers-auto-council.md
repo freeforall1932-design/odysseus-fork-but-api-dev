@@ -34,6 +34,15 @@ because Odysseus does not implement those protocols yet. The license key is encr
 browser, and `Instance-Id` rides along on gateway calls. **Unlink license** releases the seat and disables the matching
 endpoints. Details and the wire contract: `docs/CHATBOX_AI.md` in the repository (the Pages tree only links pages it ships).
 
+### Key rotation (many keys, one provider)
+
+An endpoint can carry a pool of credentials: the endpoint's own key plus any number added in the
+provider dialog. When one key is rate-limited or out of quota, the same turn is retried on the next
+healthy key, so a single chat keeps its place instead of stopping at a cutoff. Rotation is key-scoped
+(`401`/`402`/`403`/`429` only); provider outages still take the normal fallback path. The conversation
+is untouched because messages, tools and memory belong to the session, not to the key. Details:
+`docs/KEY_POOL.md` in the repository.
+
 ## Auto
 `PUT /api/auto/pool` stores the pool (max 60) and settings in the existing per-user prefs store.
 `POST /api/auto/route {message, has_image?, needs_tools?, keep_local?, exclude?}` returns `{endpoint_id, model, reason, source}`.

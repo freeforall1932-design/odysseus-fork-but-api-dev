@@ -37,6 +37,33 @@ class ChatboxActivateBody(BaseModel):
     instance_name: str = Field("", max_length=64)
 
 
+class KeyPoolAddBody(BaseModel):
+    endpoint_id: str = Field(..., max_length=64)
+    api_key: str = Field(..., max_length=2048)
+    label: str = Field("", max_length=80)
+    priority: int = Field(0, ge=-1000, le=1000)
+
+
+class KeyPoolToggleBody(BaseModel):
+    is_enabled: bool
+
+
+def _endpoint_exists(endpoint_id: str) -> bool:
+    from core.database import ModelEndpoint, get_db_session
+
+    try:
+        with get_db_session() as db:
+            return (
+                db.query(ModelEndpoint.id)
+                .filter(ModelEndpoint.id == endpoint_id)
+                .first()
+                is not None
+            )
+    except Exception:  # pragma: no cover - storage failure answers 404 upstream
+        logger.warning("Could not look up model endpoint %s", endpoint_id, exc_info=True)
+        return False
+
+
 def _chatbox_client(timeout: float = 20.0) -> httpx.AsyncClient:
     from src.tls_overrides import llm_verify
 
@@ -255,5 +282,65 @@ def setup_provider_routes() -> APIRouter:
         chatbox_ai.remove_license(owner)
         return {"ok": True, "configured": False, "warning": warning or None,
                 "disabled_endpoints": disabled}
+
+    # ------------------------------------------------------------------ key pool
+    @router.get("/keys")
+    async def key_pool_status(request: Request, endpoint_id: str = ""):
+        """Masked credentials + live health for one endpoint's pool."""
+        require_admin(request)
+        from src import key_pool
+
+        if not endpoint_id.strip():
+            raise HTTPException(400, "endpoint_id is required.")
+        if not _endpoint_exists(endpoint_id):
+            raise HTTPException(404, "Unknown model endpoint.")
+        return key_pool.describe_pool(endpoint_id)
+
+    @router.post("/keys")
+    async def key_pool_add(request: Request, body: KeyPoolAddBody):
+        """Add one credential to an endpoint. The endpoint's own key stays first."""
+        require_admin(request)
+        from src import key_pool
+
+        if not _endpoint_exists(body.endpoint_id):
+            raise HTTPException(404, "Unknown model endpoint.")
+        try:
+            added = key_pool.add_key(
+                body.endpoint_id,
+                body.api_key,
+                label=body.label.strip(),
+                priority=body.priority,
+                owner=get_current_user(request) or None,
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        return {"ok": True, **added, "pool": key_pool.describe_pool(body.endpoint_id)}
+
+    @router.delete("/keys/{key_row_id}")
+    async def key_pool_remove(request: Request, key_row_id: str):
+        require_admin(request)
+        from src import key_pool
+
+        if not key_pool.remove_key(key_row_id):
+            raise HTTPException(404, "Unknown pooled key.")
+        return {"ok": True}
+
+    @router.patch("/keys/{key_row_id}")
+    async def key_pool_toggle(request: Request, key_row_id: str, body: KeyPoolToggleBody):
+        require_admin(request)
+        from src import key_pool
+
+        if not key_pool.set_enabled(key_row_id, body.is_enabled):
+            raise HTTPException(404, "Unknown pooled key.")
+        return {"ok": True}
+
+    @router.post("/keys/reset")
+    async def key_pool_reset(request: Request, endpoint_id: str = ""):
+        """Forget cooldowns/failure streaks (after topping up a provider quota)."""
+        require_admin(request)
+        from src import key_pool
+
+        key_pool.reset(endpoint_id.strip() or None)
+        return {"ok": True}
 
     return router
