@@ -52,6 +52,9 @@ Native installs, GPU notes, Windows/macOS instructions, HTTPS, and configuration
 ## Features
 
 - **Chat + Agents** — local/API models, tools, MCP, files, shell, skills, and memory.
+- **Bring your own keys** — provider onboarding, Chatbox AI license keys, Auto routing and a
+  Council of models; an endpoint can hold a whole pool of keys and rotate to the next one when a
+  key is rate-limited or out of quota, continuing the same answer mid-sentence.
 - **Cookbook** — hardware-aware model recommendations, downloads, and serving.
 - **Deep Research** — multi-step web research with source reading and report generation.
 - **Compare** — blind side-by-side model testing and synthesis.

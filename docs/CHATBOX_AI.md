@@ -24,6 +24,11 @@ Gemini-native and OpenAI-Responses models appear in the catalog but are marked
 **not supported** and cannot be selected: Odysseus speaks OpenAI chat-completions
 and Anthropic Messages today, not Gemini's native API or the Responses API.
 
+The license key on the endpoint is a normal credential, so it also participates in the
+[key pool](KEY_POOL.md): if Chatbox rate-limits or the plan quota runs out, Odysseus rotates to
+another key on the same endpoint — including mid-answer. See the troubleshooting note below about
+which license supplies `Instance-Id`.
+
 ## Setup (beginner steps)
 
 1. Get a license key at [chatboxai.app](https://chatboxai.app).
@@ -93,6 +98,7 @@ No new Python dependency: the client uses `httpx` (already required).
 | Gemini/Codex models greyed out | Not supported yet (native Gemini / Responses APIs). |
 | Quota card stops updating | `Refresh usage` re-reads `/api/license/detail/realtime`; a 5xx keeps the last cached summary. |
 | Chat works but usage is not counted against you | The gateway may attribute a missing `Instance-Id` differently; re-fetch models to re-activate. |
+| A second license added to the same endpoint rotates without its seat | Chatbox keeps one active license row per owner, so only the active one supplies `Instance-Id`. Use one license per server for now (WORKLIST B9). |
 
 ## Files
 

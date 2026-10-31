@@ -1,8 +1,13 @@
 # Worklist
 
-Two tracks live here: the **orchestrator / agent team** work (sized from the
-2026-10-31 Q&A) and the carried-over **security audit**. Tasks are sized for one
-sitting each: S ≈ under an hour, M ≈ half a day, L ≈ a day or more.
+Tracks here: the **orchestrator / agent team** work (sized from the 2026-10-31 Q&A), the
+**key-rotation** follow-ups, upstream sync, Chatbox follow-ups, and the carried-over **security
+audit**. Tasks are sized for one sitting each: S ≈ under an hour, M ≈ half a day, L ≈ a day or more.
+
+**Merge state:** everything below marked `[x]` is on PR **#19**
+(`arena/d5cf1ff7-odysseus-fork-but-api-dev` → `main`), verified by a full-suite run and
+`upstream_sync.py --check-only` 27/27. Merge it with a **merge commit** — it carries the upstream
+merge commits that link the fork's history. Track A has not been started.
 
 ## Decisions this worklist implements (from the Q&A)
 
@@ -116,8 +121,8 @@ sitting each: S ≈ under an hour, M ≈ half a day, L ≈ a day or more.
 
 - [x] **C1** Merge `source/dev` @ `516f046f` (191 commits) — `19c52bc0`.
 - [x] **C2** Retry after the owner fast-forwarded the fork: merge `source/dev` @ `ef3467e8` (10 commits) — `515ae4a6`; no conflicts; model-routing fixes compose with `_first_default_model`.
-- [ ] **C3** Re-run the sync whenever the fork moves; `gh repo sync` returns HTTP 403 from the sandbox, so the owner must fast-forward the fork first.
-- [ ] **C4** Keep `UPSTREAM_SYNC.md`'s manifest rows current for every new downstream file (key pool and agent team included).
+- [ ] **C3 (ongoing)** Re-run the sync whenever the fork moves; `gh repo sync` returns HTTP 403 from the sandbox, so the owner must fast-forward the fork first. Two syncs landed on 2026-10-31.
+- [x] **C4** Manifest rows updated for every new downstream file from this session (key pool, Chatbox, `.env.example`, `ACKNOWLEDGMENTS.md`, `routes/chat_routes.py`, `routes/compare/compare_routes.py`, the env-reference generator and its generated page). Keep doing this for the agent team.
 
 ---
 
@@ -157,14 +162,22 @@ What was actually re-verified rather than assumed:
 | DeepSeek/other `data: {"error": ...}` 200-shaped streams rotate | only the HTTP-status path is handled | Open — B8 |
 
 Not done, and not hidden: Track A (agent team) has not been started; B3/B4/B5, B7–B12,
-C3–C4 and D1–D3 are open. Nothing from this session was left uncommitted.
+C3 (ongoing) and D1–D3 are open. Everything else from this session is committed, pushed and covered by the checks above.
 
 ## How to verify each task
 
 ```bash
-.venv/bin/python -m pytest -q tests/test_key_pool.py tests/test_provider_keys_routes.py   tests/test_provider_hub_chatbox_js.py tests/test_llm_core_streaming.py tests/test_llm_core_fallback.py
+.venv/bin/python -m pytest -q \
+  tests/test_key_pool.py tests/test_provider_keys_routes.py tests/test_provider_hub_chatbox_js.py \
+  tests/test_llm_core_streaming.py tests/test_llm_core_fallback.py tests/test_model_routes.py \
+  tests/test_provider_and_auto_routes.py tests/test_endpoint_registered_authority.py \
+  tests/test_env_reference.py tests/test_docs_no_orphan_images.py
 .venv/bin/python .github/scripts/upstream_sync.py --check-only     # 27/27 PASS expected
 node --check static/js/providerHub.js
+
+# Before merging, compare the full suite against pristine upstream (both ~9 min):
+git worktree add --detach /tmp/upcheck source/dev
+(cd /tmp/upcheck && .venv/bin/python -m pytest -q -p no:cacheprovider | tail -1)
 ```
 
 A task is done when its tests pass, `upstream_sync.py --check-only` still says
@@ -174,14 +187,13 @@ A task is done when its tests pass, `upstream_sync.py --check-only` still says
 
 # Security audit (carried over)
 
-**Status:** Security findings are pending user approval; no security remediation has started. Two unrelated deprecation warnings were cleaned up separately.
-
-**Status:** Security findings are pending user approval; no security remediation has started. Two unrelated deprecation warnings were cleaned up separately.
+**Status:** Security findings are pending user approval; no security remediation has started. Two
+unrelated deprecation warnings were cleaned up separately.
 
 ## Priority 0 — Obtain approval
 
 - [ ] Confirm which audit findings should be fixed and whether the agent shell/filesystem sandbox risk is in scope.
-- [ ] Keep all work on `arena/01a10a87-odysseus-fork-but-api-dev`.
+- [ ] Do the remediation on a branch cut from the current `main` (the old `arena/01a10a87-…` branch was merged long ago).
 
 ## Priority 1 — Protect auth and session persistence (A-1, High)
 

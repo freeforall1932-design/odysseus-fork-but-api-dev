@@ -1,166 +1,173 @@
 # Session Handoff
 
-## Latest session — Chatbox AI provider (2026-10-31)
+## Current state — 2026-10-31, ready to merge
 
-Branch `arena/d5cf1ff7-odysseus-fork-but-api-dev` adds a first-class **Chatbox AI** provider
-(a chatboxai.app subscription license key), matching the Chatbox desktop client's wire contract
-but using only Odysseus's existing endpoint/encryption layers.
+| | |
+|---|---|
+| Branch | `arena/d5cf1ff7-odysseus-fork-but-api-dev` |
+| PR | **#19** → `main`, open |
+| Working tree | clean; everything pushed |
+| Upstream baseline | `freeforall1932-design/odysseus-fork-but-api` @ `ef3467e8` (level with `odysseus-dev/dev`) |
+| Downstream delta vs upstream | 93 files, +22,484 / −37 |
 
-**Implemented**
+**Merge it with a merge commit (`gh pr merge 19 --merge`). Never squash or rebase this PR**: it
+carries the upstream merge commits (`19c52bc0`, `515ae4a6`) that link the fork's history to
+`odysseus-dev/odysseus`. Squashing drops the link and the next upstream sync conflicts everywhere
+(`UPSTREAM_SYNC.md`, "Automation" step 1).
 
-- `src/chatbox_ai.py` — license activate/validate/deactivate/detail, model catalog (model-list with
-  manifest fallback), per-gateway variants, plan/quota summary, encrypted storage helpers,
-  `Instance-Id` header lookup (5-minute process cache, never network I/O in header building).
-- `provider_presets.py` — `chatboxai` preset, `api_style`/`supported` on `ModelCard`, discovery adapter
-  that activates + lists + groups models. Gemini-native and OpenAI-Responses models are catalogued but
-  unsupported (Odysseus implements neither protocol yet).
-- `routes/provider_routes.py` — chatbox branch on `POST /api/providers/models` (persists license, strips
-  `instance_id`/`license_detail` from the response) plus admin-only
-  `POST /api/providers/chatbox/activate`, `GET /api/providers/chatbox/status?refresh=`, and
-  `POST /api/providers/chatbox/deactivate` (releases seat, disables matching endpoints, deletes row).
-- `core/database.py` — `ChatboxAILicense` (`EncryptedText` key/instance/detail; SHA-256 fingerprint; one
-  active row per owner). Created by `create_all`; no ALTER migration needed.
-- `src/llm_core.py` / `src/endpoint_resolver.py` — detect Chatbox's `/gateway/anthropic/` as Anthropic,
-  build `/messages` vs `/chat/completions` correctly, send `x-api-key` vs Bearer, attach `Instance-Id`,
-  label the provider "Chatbox AI".
-- `static/js/providerHub.js` — license card with plan/quota/expiry, refresh + unlink, disabled
-  "not supported" badges, and per-gateway connect (one endpoint for OpenAI models, one for Claude).
-- Docs: `docs/CHATBOX_AI.md`, `website/providers-auto-council.md`, README, ACKNOWLEDGMENTS.
+## What is on the branch
 
-**Validation**
+### 1. Chatbox AI provider (license key)
 
-- `234 passed` across provider presets, provider routes, endpoint URL/header/detection suites; the
-  Chatbox-focused suites add `80 passed` (client/routing/routes/storage/JS helper checks).
-- `node --check static/js/providerHub.js` clean; `python -c "import app"` boots and `create_all` creates
-  `chatbox_ai_licenses` on a fresh database.
-- Full suite on this branch: the same 73 failures as the base commit `c2d9bbd` (verified side by side) —
-  they are frontend tests without `node_modules`/Playwright, sandbox-only workspace/subprocess checks, and
-  two order-dependent provider tests that pass in isolation. No new failures; the one documentation link
-  regression caught by the first full run is fixed.
-- All Chatbox HTTP is mocked: the suite proves contract shape, key handling, routing and storage, **not**
-  that a real license works. A live check needs a key and egress to `api.chatboxai.app` (blocked in the
-  sandbox). Report this honestly before claiming it works end-to-end.
+Paste a chatboxai.app license key in the provider dialog; the server activates the seat, lists the
+plan's models, and routes turns through Chatbox's OpenAI- and Anthropic-compatible gateways. API
+compatibility only — no Chatbox code is bundled or redistributed.
 
-**Shipped**
+- `src/chatbox_ai.py` — license activate/validate/deactivate/detail, catalogue (`model_list`, with
+  `model_manifest` fallback), gateway mapping, `Instance-Id` cache, key masking.
+- `core/database.py::ChatboxAILicense` — encrypted key/instance/detail, SHA-256 fingerprint, one
+  active row per owner.
+- `routes/provider_routes.py` — chatbox branch on `POST /api/providers/models` plus
+  `/api/providers/chatbox/{activate,status,deactivate}`.
+- `src/llm_core.py`, `src/endpoint_resolver.py` — Claude gateway detected as Anthropic, `/v1`
+  handling, `Instance-Id` merged into `build_headers`, "Chatbox AI" provider label.
+- `static/js/providerHub.js` — license card (plan/quota/expiry), per-gateway connect, unsupported
+  badges, unlink reporting disabled endpoints.
+- `docs/CHATBOX_AI.md`.
 
-- Commits `7602390` (feature), `05299dd` (keyless headers / pinned default), `51cad1f` (Pages link fix) on
-  `arena/d5cf1ff7-odysseus-fork-but-api-dev`; PR #19 targets `main`.
+### 2. API key pools + rotation (the BYOR orchestrator)
 
-**Deliberately not done**
+One provider, several keys. A rate-limited or exhausted key is skipped and the same turn continues on
+the next one.
 
-- No first-party Odysseus-hosted API (the user clarified they want Chatbox AI itself, not a new gateway).
-- No Gemini-native / OpenAI-Responses chat adapters; no image/embedding/RAG/account-login Chatbox features.
-- No Electron/Android shell work (user deferred until after research). Odysseus is a local web server;
-  the portable Windows and macOS launchers already open the local URL in the browser.
-
-**Next likely steps**
-
-1. Live-key smoke test on a machine that can reach `api.chatboxai.app`; verify `Instance-Id` is accepted and
-   quota is attributed.
-2. If Claude calls fail because the gateway expects a different beta header, capture the response and add it
-   in `build_headers` (do not guess).
-3. Decide whether to add a Gemini-native adapter (larger change) or hide those models entirely.
-
-## Latest session — key rotation (BYOR pool) and upstream sync (2026-10-31)
-
-**Worklist.** `WORKLIST.md` now opens with the tracks derived from the 2026-10-31 Q&A: **A** in-app
-agent team (ChatDev-inspired, A1–A9), **B** key-rotation follow-ups (B1–B6), **C** upstream sync,
-**D** Chatbox follow-ups. The security audit was kept intact below it.
-
-**Upstream sync.** `source/dev` @ `516f046f` (191 commits) is merged into the branch as merge commit
-`19c52bc0`; after the owner fast-forwarded the fork, `source/dev` @ `ef3467e8` (10 commits) was merged
-as `515ae4a6` with no conflicts (the upstream model-routing fixes compose with `_first_default_model`).
-
-In the first merge only `.gitleaks.toml` and `static/sw.js` conflicted; both resolved by the manifest
-rules (upstream allowlist kept + downstream historical fixture re-appended; upstream `CACHE_NAME`
-`odysseus-v1115-pr40-editor-precache` bumped to `...-providerhub`). Every Chatbox hook survived in the
-auto-merged upstream files. Gates: `upstream_sync.py --check-only` 27/27, 485 tests on the first sync
-and 635 on the second, app boots on `0.0.0.0:7011`, `/api/providers/*` and `/api/auto/pool` answer 401
-(registered behind auth).
-The mirror fork is now level with `odysseus-dev/dev`; `gh repo sync` still returns HTTP 403 from this
-sandbox, so each sync needs the owner to fast-forward the fork first.
-
-**Key pool (new).** One endpoint, many credentials, automatic rotation:
-
-- `core/database.py::ProviderKey` — encrypted `api_key`, SHA-256 `key_fingerprint`, `priority`,
-  `is_enabled`, endpoint FK. The endpoint's own `api_key` is implicitly the first pool member, so
-  nothing migrates.
-- `src/key_pool.py` — selection (priority → least-recently-used), cooldowns (`429` honors
-  `Retry-After` else 60 s, `402`/quota `403` 30 min, `401` 1 h, three provider-wide failures rest a key
-  30 s), rotation, header swap, masking, `describe_pool()`. Health is **process memory only** (no DB
-  write on the chat path); credentials are cached 15 s with invalidation on mutation.
+- `core/database.py::ProviderKey` — encrypted key, fingerprint, priority, enabled. The endpoint's own
+  `api_key` is implicitly the first pool member, so nothing migrates.
+- `src/key_pool.py` — priority → least-recently-used selection, key-scoped cooldowns (`401` 1 h,
+  `402`/quota `403` 30 min, `429` honours `Retry-After` else 60 s), header swap, masking,
+  `describe_pool()`. Health is process memory only; the chat path never writes to the DB to rotate.
 - `resolve_endpoint_runtime()` consults the pool, so chat, agent tools, skills, research, webhooks and
-  background tasks all rotate without knowing about it. `stream_llm()` retries a pre-first-token
-  `401/402/403/429` on the next key; `llm_call_async()` retries immediately instead of sleeping.
-  After output starts, the error is surfaced (a silent splice would duplicate text).
-- Routes `GET/POST/DELETE/PATCH /api/providers/keys*` (admin), and an "API key rotation (pool)" card in
-  the provider dialog (`static/js/providerHub.js`, `poolKeyLabel` exported for tests).
-- `docs/KEY_POOL.md` documents policy, storage and seams. 726 tests pass across the touched suites.
+  background tasks all rotate. **The endpoint's own key is never cached** — a revoked key stops being
+  used on the next request.
+- `stream_llm()` restarts before the first token; after a mid-answer failure it re-sends the exact
+  partial text as an assistant prefix so the next key continues the sentence (tool-call streams are
+  never spliced; 3 continuations max). `llm_call_async()` rotates instead of sleeping on the same key
+  and no longer marks a key healthy when a `200` carries an `{"error": ...}` body.
+- `routes/provider_routes.py` — `GET/POST/DELETE/PATCH /api/providers/keys*`, `POST
+  /api/providers/keys/reset` (admin only).
+- `static/js/providerHub.js` — "API key rotation (pool)" card, `poolKeyLabel()` exported for tests.
+- `docs/KEY_POOL.md`.
 
-**Session audit (this turn).** The full suite — not the targeted suites — caught three regressions that
-targeted runs had missed, all now fixed and covered:
+### 3. Upstream syncs
 
-1. the pool cache also cached the endpoint's own key for 15 s, so a replaced/removed key kept being
-   sent (28 upstream authority tests failed; a revoked key stayed in use). The primary is now never
-   cached, and `resolve_endpoint_runtime` hands in the live row value.
-2. `ODYSSEUS_KEY_POOL_DISABLED` had no `VARIABLE_NOTES` entry, so `website/configuration-reference.md`
-   was stale (3 failures).
-3. the service-worker `CACHE_NAME` suffix `-providerhub` broke upstream's
-   `re.fullmatch(r'odysseus-v\d+-pr40-editor-precache')` invariant across 43 editor tests; the name is
-   now `odysseus-v1116-pr40-editor-precache` and the `UPSTREAM_SYNC.md` rule says to increment the
-   version number instead of appending a suffix.
+- `19c52bc0` — `source/dev` @ `516f046f`, 191 commits. Conflicts: `.gitleaks.toml` (upstream
+  allowlist kept, downstream historical-fixture block re-appended) and `static/sw.js` (`CACHE_NAME`
+  bumped, `providerHub.js` re-added to `PRECACHE`).
+- `515ae4a6` — `source/dev` @ `ef3467e8`, 10 commits, no conflicts. Upstream's model-routing fixes
+  compose with `_first_default_model()`.
 
-Also fixed: a key that answers `200` with an `{"error": ...}` body was recorded as *healthy* before the
-body was inspected (`_note_key_failure` now handles it), and the non-stream rotation hook had no test.
+## Verification
 
-Final comparison, both trees run in full in this sandbox: **ours 76 failed / 17,119 passed vs. upstream
-`ef3467e8` 75 failed / 16,856 passed**. The only difference is the two known order-dependent
-`test_provider_and_auto_routes` cases (they pass in isolation; tracked as B13). Every other failure also
-fails on pristine upstream here (Playwright, bubblewrap, tmux, ffmpeg).
+- `upstream_sync.py --check-only` → **27/27 PASS** (symbols, downstream lines, precache assets,
+  `node --check`, `py_compile`).
+- Full suite, both trees run in full in this sandbox:
 
-**Not built yet** (user's next asks): multi-agent "team" orchestration (architect / implementer /
-reviewer roles with a shared handoff), and any cross-process health sharing. See `WORKLIST.md` Track A.
+  | tree | failed | passed |
+  |---|---|---|
+  | this branch | 76 | 17,119 |
+  | pristine upstream `ef3467e8` | 75 | 16,856 |
 
-## Upstream sync (read this first)
+  The only difference is two known order-dependent `test_provider_and_auto_routes` cases that pass in
+  isolation (WORKLIST B13). Everything else fails identically on pristine upstream here — Playwright,
+  bubblewrap, tmux and ffmpeg are unavailable in the sandbox.
+- Runtime: app boots on `0.0.0.0:7011`; `/api/providers/presets`, `/api/providers/chatbox/status` and
+  `/api/auto/pool` answer 401 (registered, behind auth); `sw.js` and `index.html` serve the
+  providerHub entry; `create_all` creates `chatbox_ai_licenses` and `provider_keys` on a fresh DB.
+- Targeted suites: 726 passed across model-routing, provider, Chatbox, key-pool and sync suites.
 
-- This repository shares git history with upstream since merge commit `0f5c3c94` (PR #10, 2026-10-14, upstream `dev` @ `86b886c6`).
-- New upstream commits arrive automatically: the "Upstream sync" workflow (`.github/workflows/upstream-sync.yml`, script `.github/scripts/upstream_sync.py`) merges the fork into a `sync/upstream` PR on every push to `main` and daily, and files an issue when the merge conflicts. Setup (PAT secret `UPSTREAM_SYNC_TOKEN`, optional auto-merge) and the manual procedure are in `UPSTREAM_SYNC.md`; a manual sync is a 15-30 minute three-way merge, and the file lists every downstream customization that must survive, the per-file conflict rules, the verification commands, and the PR/CI gotchas.
-- Never re-import the project from an archive: that disconnects the histories again (recovery recipe is in `UPSTREAM_SYNC.md`, Appendix A).
+## Known limitations (all tracked in `WORKLIST.md`)
 
-## Current state (historical: 2026-10-05 extraction session)
+- **No live Chatbox license has ever been used** — no egress to `api.chatboxai.app` here; every test is
+  mocked. A real key is still unverified (D1).
+- The key pool has not been exercised in a browser (no Playwright here) — B10.
+- Not yet rotating: the sync `llm_call` (B7), and providers that answer `200` with an error body (B8,
+  now accounted as a failure but not rotated).
+- Pools on Chatbox endpoints are incomplete: a second license has no active row, so it rotates without
+  its `Instance-Id` — B9.
+- Gemini-native / OpenAI-Responses Chatbox models are listed but disabled (D2).
+- Desktop/Android shells remain deferred by the user.
+- Security audit findings are still **pending approval and unfixed** (`audit.md`, below).
 
-- Repository: `/home/user/odysseus-fork-but-api-dev`
-- Branch at the time: `arena/01a10a87-odysseus-fork-but-api-dev` (merged since; use your own working branch and open PRs against `main`)
-- The source archive `odysseus-fork-but-api-dev.zip` was deleted at the user's request. The extracted project files remain in the repository root.
-- Audit findings are recorded in `audit.md`; they are **pending approval**. No security-finding remediations were applied. The only source edits after the audit are unrelated deprecation-warning cleanups.
-- Root handoff files created: `audit.md`, `SESSION_HANDOFF.md`, and `WORKLIST.md`.
+## Merge and after-merge steps
 
-## Audit summary
+1. `gh pr merge 19 --merge` (see the warning at the top — merge commit only).
+2. Run the upstream-sync workflow once against the new `main`, or wait for its nightly run, to confirm
+   the manifest still matches (C4).
+3. If the owner fast-forwards the mirror fork again, the next sync is the same procedure; `gh repo
+   sync` returns HTTP 403 from this sandbox, so fork updates must come from the owner.
 
-1. High: `core/atomic_io.py` and setup paths create auth/session files without owner-only permissions; raw session tokens are persisted in `sessions.json`.
-2. High: Token-chat URL validation is vulnerable to DNS rebinding because the checked address is not pinned to the later HTTPX connection; resumed sessions skip the direct URL validation branch.
-3. High, conditional: `/api/auth/setup` is auth-exempt and can create the first admin from a remote request if the instance is exposed before setup completes.
+## Next session packet (Track A — in-app agent team)
+
+Read in this order: this file → `WORKLIST.md` Track A → `src/council.py` and `src/task_endpoint.py`
+(the LLM plumbing to reuse) → `src/memory_vector.py` (`MemoryVectorStore.add(memory_id, text)`, the
+RAG store the team writes into).
+
+Start at **A1 + A2** (`src/agent_team.py` role catalogue and sequential runner — additive, no DB, no
+UI, no routes). Then A3 (RAG-backed shared memory), A4 (run persistence), A5 (SSE API), A6 (Team tab),
+A7 (reviewer loop), A8 (parallel roles), A9 (docs).
+
+Cold-start limits to expect: no ChromaDB (memory degrades to "brief only"), no Playwright/Chromium,
+no `node_modules` (the static gate's `node --check` still works), and `pytest` needs the repo-local
+`.venv` recreated from `requirements.txt`.
+
+## Commit history (this session, current branch)
+
+```
+338c7c35 Record the final audit numbers and the order-dependent test item
+4f6a836e Close the audit table with the upstream-vs-ours full-suite diff
+3029c8ce Bump the service-worker cache version instead of suffixing it
+f4ec8356 Record the two audit regressions in the worklist audit table
+d579f4ac Fix a stale-key cache and document the pool's env switch
+567df7d8 Audit the key pool: fix bad success accounting, cover non-stream rotation
+95dd7b62 Split the orchestrator Q&A into a sized worklist
+515ae4a6 (merge) upstream fork dev @ ef3467e8 — 10 commits, no conflicts
+3e2405f4 Continue a stream on the next key instead of cutting the answer
+87395cee Add API key pools with automatic rotation
+19c52bc0 (merge) upstream fork dev @ 516f046f — 191 commits, 2 conflicts
+2bc48a1e Record Chatbox AI validation and shipped commits in the handoff
+51cad1fb Keep the Pages guide's Chatbox link inside the website tree
+05299dd1 Make keyless endpoint headers and pinned defaults explicit
+76023907 Add Chatbox AI license-key provider support
+```
+
+Earlier commits on this branch (provider onboarding, Auto routing, Council UI, the sync automation
+and the security audit) predate this session; see `git log main` and `audit.md`.
+
+## Upstream sync (read before any merge or rebase)
+
+- This repository shares git history with upstream since merge commit `0f5c3c94` (PR #10, 2026-10-14,
+  upstream `dev` @ `86b886c6`).
+- New upstream commits arrive automatically: the "Upstream sync" workflow
+  (`.github/workflows/upstream-sync.yml`, script `.github/scripts/upstream_sync.py`) merges the fork
+  into a `sync/upstream` PR on every push to `main` and daily, and files an issue when the merge
+  conflicts. Setup (PAT secret `UPSTREAM_SYNC_TOKEN`, optional auto-merge) and the manual procedure are
+  in `UPSTREAM_SYNC.md`; a manual sync is a 15–30 minute three-way merge.
+- Never re-import the project from an archive: that disconnects the histories (recovery recipe in
+  `UPSTREAM_SYNC.md`, Appendix A). Never squash or rebase a sync PR.
+
+## Carried over: security audit (pending approval)
+
+Findings recorded in `audit.md`; **none has been fixed** — approval is still pending, and the only
+source edits since the audit are unrelated deprecation cleanups.
+
+1. High: `core/atomic_io.py` and setup paths create auth/session files without owner-only permissions;
+   raw session tokens are persisted in `sessions.json`.
+2. High: token-chat URL validation is vulnerable to DNS rebinding (checked address not pinned to the
+   later HTTPX connection); resumed sessions skip the direct URL validation branch.
+3. High, conditional: `/api/auth/setup` is auth-exempt and can create the first admin from a remote
+   request if the instance is exposed before setup completes.
 4. Medium: `require_privilege()` fails open on malformed privilege data or lookup errors.
-5. Documented residual risk: agent shell/filesystem tools have no OS-level sandbox, per `THREAT_MODEL.md`.
+5. Documented residual risk: agent shell/filesystem tools have no OS-level sandbox, per
+   `THREAT_MODEL.md`.
 
-See `audit.md` for exact locations, impact, remediation suggestions, and evidence.
-
-## Validation status
-
-- Created repo-local, Git-ignored `.venv/` and installed `requirements.txt`; no dependency manifest was changed.
-- Focused audit tests: **81 passed, no warnings** across API chat security, auth policy/privileges, root-path auth, session revocation, and atomic I/O.
-- Security area: **832 passed, 5,124 deselected, no warnings** via `tests/run_focus.py --area security`.
-- Cleaned up the SQLAlchemy `declarative_base()` import and Pydantic `.dict()` deprecations; the security-area run confirms both warnings are gone.
-- AST parsing succeeded for 1,159 Python files with no syntax errors.
-- A standard-library permission probe confirmed mode `0644` for atomic JSON writes under umask `022`.
-- `git diff --check` was clean.
-
-Tests pass against the current code but do not cover every reported gap. No audit finding has been fixed; rerun relevant tests after any approved security remediation.
-
-## Working-tree notes
-
-The initial repository contained a tracked archive and a minimal README. The archive is now deleted; the extracted project files are untracked, and the README was replaced during extraction. The current branch is still the Arena session branch. No commit or push was made.
-
-## Next step
-
-Wait for the user's approval on the findings/remediation scope. Then address approved items on the current branch, add regression tests, and rerun the focused tests plus relevant neighboring suites with the existing repo-local `.venv/`; run the broader suite as practical.
+Baseline at audit time: 81 focused tests and 832 security-area tests passed. Tests pass against the
+current code but do not cover every reported gap; rerun after any approved remediation.
