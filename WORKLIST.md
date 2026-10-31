@@ -115,6 +115,22 @@ merge commits that link the fork's history. Track A has not been started.
 **B12 — Rotation lookup cost** · S (optional)
 - [ ] `endpoint_for_key()` decrypts every `ModelEndpoint` row until it finds a match. Fine on failure paths, wasteful with many endpoints: add a fingerprint index or cache the mapping.
 
+**B14 — A test that boots the whole app poisoned a later test in the same shard** · S
+- [x] CI's pytest shard 3 was red on every run of this branch while shards 1/2/4 passed, and the failure
+  was invisible locally because the sandbox cannot read the Actions log. Re-ran the shard with a
+  temporary step that republished the log tail as a check-run annotation: the failing test was
+  `tests/test_tool_policy.py::test_web_fetch_js_failure_exposes_private_browser_next_round`, stopping at
+  "Exact approval required before tool start: web_fetch" with `len(sent_tools) == 1`. Cause:
+  `tests/test_settings_sidebar_build_provenance.py::test_api_version_reports_version_build_and_commit`
+  opened `TestClient(app)` **as a context manager**, so the app lifespan started the scheduler, MCP
+  servers and the exact-approval policy inside the pytest process and left the globals installed. It
+  never reproduced on `main` only because `tests/_shards.py` packs by file set: this branch's new
+  Chatbox/key-pool test files shifted the polluter in front of the victim. The version test now calls
+  `TestClient(app)` without entering the lifespan — the route is auth-exempt and needs none of it.
+- [ ] Still open: nothing stops the next app-boot test from leaking the same globals. A shared fixture
+  that snapshots and restores process state (or a subprocess rule for app-boot tests) would make shard
+  order irrelevant.
+
 ---
 
 ## Track C — Upstream sync
@@ -159,6 +175,7 @@ What was actually re-verified rather than assumed:
 | A new env var is documented | **was wrong**: `ODYSSEUS_KEY_POOL_DISABLED` had no note, so the generated config reference went stale (3 failures) | Fixed — note added, page regenerated |
 | The service-worker cache bump keeps upstream's editor suites green | **was wrong**: the previous sync appended `-providerhub`, but upstream asserts `re.fullmatch(r'odysseus-v\d+-pr40-editor-precache')` → 43 failures. Now `odysseus-v1116-pr40-editor-precache`, and the manifest rule says to increment the number | Fixed (`3029c8ce`) |
 | Full suite vs pristine upstream | ran both trees in full and diffed the failure lists | **only** the 2 known order-dependent `test_provider_and_auto_routes` cases differ (they pass in isolation); everything else also fails on upstream `ef3467e8` in this sandbox |
+| CI shard 3 red while 1/2/4 passed | could not read the Actions log from the sandbox; re-ran the shard with a temporary annotation step and got the test id — an upstream test booted the app lifespan and poisoned the next agent-loop test in the same shard | Fixed (B14) |
 | DeepSeek/other `data: {"error": ...}` 200-shaped streams rotate | only the HTTP-status path is handled | Open — B8 |
 
 Not done, and not hidden: Track A (agent team) has not been started; B3/B4/B5, B7–B12,

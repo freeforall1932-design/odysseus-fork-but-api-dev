@@ -74,16 +74,23 @@ the next one.
 
   | tree | failed | passed |
   |---|---|---|
-  | this branch | 76 | 17,119 |
+  | this branch | 75 | 17,120 |
   | pristine upstream `ef3467e8` | 75 | 16,856 |
 
-  The only difference is two known order-dependent `test_provider_and_auto_routes` cases that pass in
-  isolation (WORKLIST B13). Everything else fails identically on pristine upstream here — Playwright,
-  bubblewrap, tmux and ffmpeg are unavailable in the sandbox.
+  Both trees fail the same count. Two cases fail only here (the known order-dependent
+  `test_provider_and_auto_routes` pair, WORKLIST B13) and two only on upstream
+  (`test_notes_native_cleanup` and the `test_tool_policy` case B14 fixed here). Everything else fails
+  identically — Playwright, bubblewrap, tmux and ffmpeg are unavailable in the sandbox.
 - Runtime: app boots on `0.0.0.0:7011`; `/api/providers/presets`, `/api/providers/chatbox/status` and
   `/api/auto/pool` answer 401 (registered, behind auth); `sw.js` and `index.html` serve the
   providerHub entry; `create_all` creates `chatbox_ai_licenses` and `provider_keys` on a fresh DB.
 - Targeted suites: 726 passed across model-routing, provider, Chatbox, key-pool and sync suites.
+- CI shard 3 was red on every run while shards 1/2/4 passed. The Actions log host is unreachable from
+  this sandbox, so the failure was diagnosed by re-running the shard with a temporary step that
+  republished the log tail as a check-run annotation: `tests/test_tool_policy.py::test_web_fetch_js_failure_exposes_private_browser_next_round`
+  stopped after round 1 because `tests/test_settings_sidebar_build_provenance.py` had booted the app
+  lifespan (`with TestClient(app)`) and left the exact-approval policy installed. Fixed by dropping the
+  context manager there; the underlying leak that can bite the next app-boot test is WORKLIST B14.
 - Secret scan: `gitleaks` failed on **every** run of this branch (its first four runs back to
   `05299dd1`) while `main` stayed green. Cause: the mocked licence fixture in
   `tests/test_provider_chatbox_routes.py` (`cbx-route-test-key-abcdef123456`, entropy 4.16) tripped
