@@ -29,12 +29,22 @@ but using only Odysseus's existing endpoint/encryption layers.
 
 **Validation**
 
-- `234 passed` across provider presets, provider routes, endpoint URL/header/detection suites.
-- `32 passed` for the new Chatbox client/routing/route suites, `19 passed` for storage + JS helpers.
-- `node --check static/js/providerHub.js` clean.
+- `234 passed` across provider presets, provider routes, endpoint URL/header/detection suites; the
+  Chatbox-focused suites add `79 passed` (client/routing/routes/storage/JS helper checks).
+- `node --check static/js/providerHub.js` clean; `python -c "import app"` boots and `create_all` creates
+  `chatbox_ai_licenses` on a fresh database.
+- Full suite on this branch: the same 73 failures as the base commit `c2d9bbd` (verified side by side) —
+  they are frontend tests without `node_modules`/Playwright, sandbox-only workspace/subprocess checks, and
+  two order-dependent provider tests that pass in isolation. No new failures; the one documentation link
+  regression caught by the first full run is fixed.
 - All Chatbox HTTP is mocked: the suite proves contract shape, key handling, routing and storage, **not**
   that a real license works. A live check needs a key and egress to `api.chatboxai.app` (blocked in the
   sandbox). Report this honestly before claiming it works end-to-end.
+
+**Shipped**
+
+- Commits `7602390` (feature), `05299dd` (keyless headers / pinned default), `51cad1f` (Pages link fix) on
+  `arena/d5cf1ff7-odysseus-fork-but-api-dev`; PR #19 targets `main`.
 
 **Deliberately not done**
 
