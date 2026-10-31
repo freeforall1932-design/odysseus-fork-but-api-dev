@@ -7,6 +7,7 @@
 | Branch | `arena/d5cf1ff7-odysseus-fork-but-api-dev` |
 | PR | **#19** → `main`, open |
 | Working tree | clean; everything pushed |
+| CI on this branch | description check, gitleaks, actionlint, hadolint, zizmor, pip-audit, `node --check` all pass |
 | Upstream baseline | `freeforall1932-design/odysseus-fork-but-api` @ `ef3467e8` (level with `odysseus-dev/dev`) |
 | Downstream delta vs upstream | 93 files, +22,484 / −37 |
 
@@ -83,6 +84,14 @@ the next one.
   `/api/auto/pool` answer 401 (registered, behind auth); `sw.js` and `index.html` serve the
   providerHub entry; `create_all` creates `chatbox_ai_licenses` and `provider_keys` on a fresh DB.
 - Targeted suites: 726 passed across model-routing, provider, Chatbox, key-pool and sync suites.
+- Secret scan: `gitleaks` failed on **every** run of this branch (its first four runs back to
+  `05299dd1`) while `main` stayed green. Cause: the mocked licence fixture in
+  `tests/test_provider_chatbox_routes.py` (`cbx-route-test-key-abcdef123456`, entropy 4.16) tripped
+  the default `generic-api-key` rule, and the workflow scans with `fetch-depth: 0`, so fixing the
+  current tree alone would not clear it. Fixed in `342db66a`: the fixture is now letters-only
+  (`cbx-route-fixture-license`, which the rule's own `^[a-zA-Z_.-]+$` allowlist skips) and the
+  retired literal is allowlisted by an exact anchored regex next to the existing `sk-LEAKTEST-123456`
+  block. Verified green. Appendix B of `UPSTREAM_SYNC.md` has the local check procedure.
 
 ## Known limitations (all tracked in `WORKLIST.md`)
 
@@ -122,6 +131,8 @@ no `node_modules` (the static gate's `node --check` still works), and `pytest` n
 ## Commit history (this session, current branch)
 
 ```
+342db66a Allowlist the retired Chatbox licence fixture for the history secret scan
+17784f72 Sweep the handoff and sync manifest before merging
 338c7c35 Record the final audit numbers and the order-dependent test item
 4f6a836e Close the audit table with the upstream-vs-ours full-suite diff
 3029c8ce Bump the service-worker cache version instead of suffixing it
