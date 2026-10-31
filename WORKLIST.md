@@ -147,6 +147,8 @@ What was actually re-verified rather than assumed:
 | A locked-up pool cannot break routing | `_pooled_key()` swallows exceptions and falls back to the endpoint's own key; covered by `test_resolve_endpoint_runtime_survives_a_broken_pool` | OK |
 | Full suite has no new failures | full run vs. the base-commit baseline (same 73 environment-only failures) | see the run recorded in `SESSION_HANDOFF.md` |
 | The pool card works in a browser | **not possible here** (no Playwright/Chromium) | Open — B10 |
+| A removed/replaced endpoint key stops being used immediately | **was wrong**: the pool cache also cached the endpoint's own key for 15 s, so a revoked key kept being sent. 28 upstream authority tests caught it; the primary is now never cached | Fixed (`d579f4ac`) — regression test added |
+| A new env var is documented | **was wrong**: `ODYSSEUS_KEY_POOL_DISABLED` had no note, so the generated config reference went stale (3 failures) | Fixed — note added, page regenerated |
 | DeepSeek/other `data: {"error": ...}` 200-shaped streams rotate | only the HTTP-status path is handled | Open — B8 |
 
 Not done, and not hidden: Track A (agent team) has not been started; B3/B4/B5, B7–B12,
