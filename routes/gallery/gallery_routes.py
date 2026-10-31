@@ -18,6 +18,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from core.database import SessionLocal, GalleryImage, GalleryAlbum, ModelEndpoint
 from core.database import Session as DbSession
 from src.auth_helpers import get_current_user, owner_filter, require_privilege
+from src.session_search import escape_like_pattern
 from src.upload_limits import (
     read_upload_limited,
     GALLERY_UPLOAD_MAX_BYTES,
@@ -303,6 +304,23 @@ def _b64_bytes(value: str, *, label: str = "image") -> bytes:
         return base64.b64decode(text)
     except Exception as exc:
         raise HTTPException(400, f"Invalid {label}") from exc
+
+
+async def _json_object(request: Request) -> dict:
+    try:
+        data = await request.json()
+    except ValueError:
+        raise HTTPException(400, "Invalid JSON body")
+    if not isinstance(data, dict):
+        raise HTTPException(400, "JSON object body required")
+    return data
+
+
+async def _image_ids(request: Request) -> list:
+    ids = (await _json_object(request)).get("image_ids", [])
+    if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
+        raise HTTPException(400, "image_ids must be a list of image ids")
+    return ids
 
 
 def _pil_image_to_b64(img, *, fmt: str = "PNG") -> str:
@@ -1184,15 +1202,18 @@ def setup_gallery_routes() -> APIRouter:
             )
             q = _owner_filter(q, user)
 
-            # Search filter (prompt + tags + ai_tags)
+            # Per-term AND search: a single `%foo bar%` LIKE only matched the
+            # exact phrase, so "red car" missed "a car that is red".
+            # LIKE wildcards are escaped per token.
             if search:
-                term = f"%{search}%"
                 from sqlalchemy import or_
-                q = q.filter(or_(
-                    GalleryImage.prompt.ilike(term),
-                    GalleryImage.tags.ilike(term),
-                    GalleryImage.ai_tags.ilike(term),
-                ))
+                for tok in search.split():
+                    term = f"%{escape_like_pattern(tok)}%"
+                    q = q.filter(or_(
+                        GalleryImage.prompt.ilike(term, escape="\\"),
+                        GalleryImage.tags.ilike(term, escape="\\"),
+                        GalleryImage.ai_tags.ilike(term, escape="\\"),
+                    ))
 
             # Tag filter. The UI stacks multiple tag pills by passing them
             # comma-separated — each tag adds a separate AND-filter so the
@@ -1203,9 +1224,10 @@ def setup_gallery_routes() -> APIRouter:
                 for one in (t.strip() for t in tag.split(",")):
                     if not one:
                         continue
+                    safe_tag = f"%{escape_like_pattern(one)}%"
                     q = q.filter(_or(
-                        GalleryImage.tags.ilike(f"%{one}%"),
-                        GalleryImage.ai_tags.ilike(f"%{one}%"),
+                        GalleryImage.tags.ilike(safe_tag, escape="\\"),
+                        GalleryImage.ai_tags.ilike(safe_tag, escape="\\"),
                     ))
 
             # Model filter
@@ -2939,14 +2961,22 @@ def setup_gallery_routes() -> APIRouter:
     @router.put("/api/gallery/albums/{album_id}")
     async def update_album(request: Request, album_id: str):
         user = get_current_user(request)
-        data = await request.json()
+        data = await _json_object(request)
+        name = data.get("name")
+        if name is not None:
+            if not isinstance(name, str) or not name.strip():
+                raise HTTPException(400, "Album name required")
+            name = name.strip()
+        description = data.get("description")
+        if description is not None and not isinstance(description, str):
+            raise HTTPException(400, "Album description must be a string")
         db = SessionLocal()
         try:
             album = _get_or_404_album(db, album_id, user)
-            if data.get("name") is not None:
-                album.name = data["name"]
-            if data.get("description") is not None:
-                album.description = data["description"]
+            if name is not None:
+                album.name = name
+            if description is not None:
+                album.description = description
             if data.get("cover_id") is not None:
                 cover_id = data["cover_id"] or None
                 if cover_id:
@@ -2976,8 +3006,7 @@ def setup_gallery_routes() -> APIRouter:
     @router.post("/api/gallery/albums/{album_id}/add")
     async def add_to_album(request: Request, album_id: str):
         user = get_current_user(request)
-        data = await request.json()
-        ids = data.get("image_ids", [])
+        ids = await _image_ids(request)
         db = SessionLocal()
         try:
             _get_or_404_album(db, album_id, user)
@@ -2994,8 +3023,7 @@ def setup_gallery_routes() -> APIRouter:
     @router.post("/api/gallery/albums/{album_id}/remove")
     async def remove_from_album(request: Request, album_id: str):
         user = get_current_user(request)
-        data = await request.json()
-        ids = data.get("image_ids", [])
+        ids = await _image_ids(request)
         db = SessionLocal()
         try:
             _get_or_404_album(db, album_id, user)
