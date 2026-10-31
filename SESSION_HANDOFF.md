@@ -97,8 +97,29 @@ sandbox, so each sync needs the owner to fast-forward the fork first.
   the provider dialog (`static/js/providerHub.js`, `poolKeyLabel` exported for tests).
 - `docs/KEY_POOL.md` documents policy, storage and seams. 726 tests pass across the touched suites.
 
+**Session audit (this turn).** The full suite — not the targeted suites — caught three regressions that
+targeted runs had missed, all now fixed and covered:
+
+1. the pool cache also cached the endpoint's own key for 15 s, so a replaced/removed key kept being
+   sent (28 upstream authority tests failed; a revoked key stayed in use). The primary is now never
+   cached, and `resolve_endpoint_runtime` hands in the live row value.
+2. `ODYSSEUS_KEY_POOL_DISABLED` had no `VARIABLE_NOTES` entry, so `website/configuration-reference.md`
+   was stale (3 failures).
+3. the service-worker `CACHE_NAME` suffix `-providerhub` broke upstream's
+   `re.fullmatch(r'odysseus-v\d+-pr40-editor-precache')` invariant across 43 editor tests; the name is
+   now `odysseus-v1116-pr40-editor-precache` and the `UPSTREAM_SYNC.md` rule says to increment the
+   version number instead of appending a suffix.
+
+Also fixed: a key that answers `200` with an `{"error": ...}` body was recorded as *healthy* before the
+body was inspected (`_note_key_failure` now handles it), and the non-stream rotation hook had no test.
+
+Final comparison, both trees run in full in this sandbox: **ours 76 failed / 17,119 passed vs. upstream
+`ef3467e8` 75 failed / 16,856 passed**. The only difference is the two known order-dependent
+`test_provider_and_auto_routes` cases (they pass in isolation; tracked as B13). Every other failure also
+fails on pristine upstream here (Playwright, bubblewrap, tmux, ffmpeg).
+
 **Not built yet** (user's next asks): multi-agent "team" orchestration (architect / implementer /
-reviewer roles with a shared handoff), and any cross-process health sharing.
+reviewer roles with a shared handoff), and any cross-process health sharing. See `WORKLIST.md` Track A.
 
 ## Upstream sync (read this first)
 

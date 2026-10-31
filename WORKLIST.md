@@ -104,6 +104,9 @@ sitting each: S ≈ under an hour, M ≈ half a day, L ≈ a day or more.
 **B11 — Priority is stored but not editable** · S
 - [ ] `describe_pool()` exposes `priority` and `POST /api/providers/keys` accepts it, but the card has no control. Add a number input, or drop the field from the response so the API does not promise what the UI cannot set.
 
+**B13 — Two order-dependent provider tests** · S
+- [ ] `tests/test_provider_and_auto_routes.py::test_local_provider_goes_through_the_docker_loopback_rewrite` and `…custom_loopback_url_uses_docker_host_rewrite_too` fail only in a full-suite run (they pass alone). `tests/test_helpers_import_state.py` swaps `sys.modules["routes.model_routes"]`, and `routes/provider_routes.py` re-imports the helper at call time, so the monkeypatch lands on a module the handler no longer uses. Pre-existing (present in the base-commit baseline, not introduced by the pool); fix by patching through `sys.modules` or by importing the helper once at module scope.
+
 **B12 — Rotation lookup cost** · S (optional)
 - [ ] `endpoint_for_key()` decrypts every `ModelEndpoint` row until it finds a match. Fine on failure paths, wasteful with many endpoints: add a fingerprint index or cache the mapping.
 
