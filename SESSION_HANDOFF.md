@@ -30,7 +30,7 @@ but using only Odysseus's existing endpoint/encryption layers.
 **Validation**
 
 - `234 passed` across provider presets, provider routes, endpoint URL/header/detection suites; the
-  Chatbox-focused suites add `79 passed` (client/routing/routes/storage/JS helper checks).
+  Chatbox-focused suites add `80 passed` (client/routing/routes/storage/JS helper checks).
 - `node --check static/js/providerHub.js` clean; `python -c "import app"` boots and `create_all` creates
   `chatbox_ai_licenses` on a fresh database.
 - Full suite on this branch: the same 73 failures as the base commit `c2d9bbd` (verified side by side) —
