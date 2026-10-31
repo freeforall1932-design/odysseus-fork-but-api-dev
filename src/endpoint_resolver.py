@@ -192,23 +192,25 @@ def resolve_endpoint_runtime(ep, owner: Optional[str] = None) -> Tuple[str, Opti
         )
         api_key = creds.get("api_key")
     else:
-        pooled = _pooled_key(getattr(ep, "id", None))
+        pooled = _pooled_key(getattr(ep, "id", None), api_key)
         if pooled:
             api_key = pooled
     return base, api_key
 
 
-def _pooled_key(endpoint_id: Optional[str]) -> Optional[str]:
+def _pooled_key(endpoint_id: Optional[str], primary: Optional[str] = None) -> Optional[str]:
     """Next healthy key from the endpoint's pool, or None to keep the primary.
 
-    Failure-proof: a broken pool must never stop a chat from starting.
+    The row's own key is handed in so a key the user just removed or replaced is
+    never served from a cache. Failure-proof: a broken pool must never stop a
+    chat from starting.
     """
     if not endpoint_id:
         return None
     try:
         from src.key_pool import pick_key
 
-        return pick_key(str(endpoint_id))
+        return pick_key(str(endpoint_id), primary=primary)
     except Exception:  # pragma: no cover - pool must never break routing
         logger.debug("key pool selection failed for %s", endpoint_id, exc_info=True)
         return None

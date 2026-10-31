@@ -440,3 +440,22 @@ def test_200_with_an_error_body_counts_as_a_key_failure(monkeypatch):
     assert entry is not None
     assert entry.successes == 0        # never counted as a success
     assert entry.failures >= 1
+
+
+def test_a_removed_primary_key_is_not_served_from_the_cache():
+    """Rotation may cache pooled keys; a replaced/removed primary must not be."""
+    from src.endpoint_resolver import resolve_endpoint_runtime
+
+    key_pool.add_key(ENDPOINT_ID, SECOND)
+    with get_db_session() as db:
+        ep = db.query(ModelEndpoint).filter(ModelEndpoint.id == ENDPOINT_ID).first()
+        assert resolve_endpoint_runtime(ep)[1] in {PRIMARY, SECOND}
+    # Rotation just cached the pool; now the primary is revoked.
+    with get_db_session() as db:
+        row = db.query(ModelEndpoint).filter(ModelEndpoint.id == ENDPOINT_ID).first()
+        row.api_key = None
+        db.flush()
+    with get_db_session() as db:
+        ep = db.query(ModelEndpoint).filter(ModelEndpoint.id == ENDPOINT_ID).first()
+        for _ in range(3):
+            assert resolve_endpoint_runtime(ep)[1] == SECOND

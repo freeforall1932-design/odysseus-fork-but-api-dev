@@ -284,35 +284,47 @@ def invalidate(endpoint_id: Optional[str] = None) -> None:
         _POOL_CACHE.pop(endpoint_id, None)
 
 
-def pool_keys(endpoint_id: str) -> List[PoolKey]:
+def pool_keys(endpoint_id: str, primary: Optional[str] = None) -> List[PoolKey]:
     """Every usable credential for one endpoint, primary first.
 
     Returns ``[]`` when the endpoint has no key at all (local servers) so callers
     can leave anonymous endpoints exactly as they were.
+
+    ``primary`` is the endpoint row's own key when the caller already has it
+    (``resolve_endpoint_runtime`` does). That value is **never cached**: key
+    rotation may use a cached pool, but a removed or replaced primary must take
+    effect on the very next request.
     """
     if not endpoint_id:
         return []
-    now = time.monotonic()
-    with _LOCK:
-        cached = _POOL_CACHE.get(endpoint_id)
-        if cached and cached[0] > now:
-            return list(cached[1])
-    keys = _load_pool_keys(endpoint_id)
-    with _LOCK:
-        _POOL_CACHE[endpoint_id] = (now + _POOL_CACHE_TTL, list(keys))
-    return keys
-
-
-def _load_pool_keys(endpoint_id: str) -> List[PoolKey]:
-    from core.database import ProviderKey, get_db_session
-
     keys: List[PoolKey] = []
-    primary = _endpoint_primary(endpoint_id)
+    primary = normalize_key(primary) if primary is not None else _endpoint_primary(endpoint_id)
     if primary:
         # Priority 0 keeps the primary in the same rotation band as pooled
         # keys (list order, not priority, is what makes it "first").
         keys.append(PoolKey(primary, "primary", 0, key_id(primary), False))
-    seen = {k.fingerprint for k in keys}
+    keys.extend(_pooled_keys(endpoint_id, exclude={k.fingerprint for k in keys}))
+    return keys
+
+
+def _pooled_keys(endpoint_id: str, exclude: Optional[set] = None) -> List[PoolKey]:
+    """The extra (persisted) credentials of one endpoint, cached briefly."""
+    now = time.monotonic()
+    with _LOCK:
+        cached = _POOL_CACHE.get(endpoint_id)
+        if cached and cached[0] > now:
+            return [k for k in cached[1] if k.fingerprint not in (exclude or set())]
+    keys = _load_pooled_keys(endpoint_id)
+    with _LOCK:
+        _POOL_CACHE[endpoint_id] = (now + _POOL_CACHE_TTL, list(keys))
+    return [k for k in keys if k.fingerprint not in (exclude or set())]
+
+
+def _load_pooled_keys(endpoint_id: str) -> List[PoolKey]:
+    from core.database import ProviderKey, get_db_session
+
+    keys: List[PoolKey] = []
+    seen: set = set()
     with get_db_session() as db:
         rows = (
             db.query(ProviderKey)
@@ -343,6 +355,7 @@ def pick_key(
     *,
     exclude: Iterable[str] = (),
     now: Optional[float] = None,
+    primary: Optional[str] = None,
 ) -> Optional[str]:
     """Choose the next credential to use for this endpoint.
 
@@ -351,7 +364,7 @@ def pick_key(
     returned rather than failing the request outright — a stale cooldown must
     never be the reason a chat cannot start.
     """
-    keys = pool_keys(endpoint_id)
+    keys = pool_keys(endpoint_id, primary=primary)
     if not keys:
         return None
     stamp = now if now is not None else time.monotonic()

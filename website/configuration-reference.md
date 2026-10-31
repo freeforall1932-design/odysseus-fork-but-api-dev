@@ -21,7 +21,7 @@ described as a switch that turns something off, the read rejects `0`, `false`,
 `no` and `off` and treats everything else as on. The `Default` column is the
 value the code falls back to when the variable is unset, quoted from the source.
 
-The source tree reads **147** `ODYSSEUS_*` variables: 90 an operator may want to set, and 57 that are internal - sentinels, fixture switches, capture hooks and development tooling. The internal ones are listed too, in their own section, so this page can be checked against the source mechanically.
+The source tree reads **148** `ODYSSEUS_*` variables: 91 an operator may want to set, and 57 that are internal - sentinels, fixture switches, capture hooks and development tooling. The internal ones are listed too, in their own section, so this page can be checked against the source mechanically.
 
 > This page is generated. Edit `scripts/generate_env_reference.py` and
 > re-run it; `tests/test_env_reference.py` enforces that the committed page
@@ -65,6 +65,7 @@ The source tree reads **147** `ODYSSEUS_*` variables: 90 an operator may want to
 | `ODYSSEUS_EDITOR_AGENT_BASES` | *unset* | `src/editor_agent_model.py` | Comma-separated base URLs for the image-editor agent backends; a single base URL in the model endpoint config wins over this list. |
 | `ODYSSEUS_FIRST_TOKEN_TIMEOUT` | `''` | `src/llm_core.py` | Seconds to wait for the first streamed token from a local endpoint before failing. Unset keeps the generous read timeout, which makes a stalled backend look like a hung agent. |
 | `ODYSSEUS_IMAGE_OPS_BASE` | `''` | `routes/gallery/gallery_routes.py` | Base URL of the image-operations backend (inpaint, outpainting and style transfer); a trailing slash is stripped before use. |
+| `ODYSSEUS_KEY_POOL_DISABLED` | `''` | `src/key_pool.py` | Set to 1 to turn off multi-key rotation entirely (every request uses the endpoint's own key). Useful for isolating a misbehaving provider pool; a pool needs two keys anyway, so most installs never set it. |
 | `ODYSSEUS_LOCAL_MODEL_GATE` | `'true'` | `src/llm_core.py` | On by default. Set 0, false, no or off to drop the gate that checks a local endpoint before routing a request to it. |
 | `ODYSSEUS_MISTRAL_REASONING_EFFORT` | `'high'` | `src/llm_core.py` | Reasoning effort sent to Mistral thinking-capable models. The API accepts high, medium, low and none. |
 | `ODYSSEUS_MLX_IMAGE_VLM_MODEL` | *unset* | `scripts/mlx_image_server.py` | Vision-language model id for the MLX image server script. Required unless `--vlm-model` is passed on the command line. |
@@ -300,7 +301,7 @@ reads three ways, because no single pattern covers the codebase:
   lines, so one read lives inside a string literal.
 
 The three passes are not redundancy. A line-based grep for a direct
-`os.environ.get("ODYSSEUS_...` call finds 117 of the 147 variables on this
+`os.environ.get("ODYSSEUS_...` call finds 117 of the 148 variables on this
 page. What it misses is reads through an env-reader helper, reads whose call
 spans more than one line, reads whose variable name is held in a module
 constant, and reads through a mapping passed in as an argument - which is the

@@ -368,6 +368,12 @@ VARIABLE_NOTES: dict[str, tuple[str, str, str]] = {
         "The same off switch for the in-process email pollers, when "
         "`odysseus-mail poll-scheduled` is the sole external driver.",
     ),
+    "ODYSSEUS_KEY_POOL_DISABLED": (
+        "Model routing and providers", USER,
+        "Set to 1 to turn off multi-key rotation entirely (every request uses "
+        "the endpoint's own key). Useful for isolating a misbehaving provider "
+        "pool; a pool needs two keys anyway, so most installs never set it.",
+    ),
     "ODYSSEUS_STARTUP_WARMUPS": (
         "Deployment and first run", USER,
         "Opt-in startup pings of the configured model endpoints. Off by default "
