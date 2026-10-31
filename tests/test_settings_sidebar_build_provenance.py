@@ -223,8 +223,11 @@ def test_api_version_reports_version_build_and_commit():
 
     from app import app
 
-    with TestClient(app) as client:
-        payload = client.get("/api/version").json()
+    # No ``with``: the app's lifespan starts the scheduler, MCP servers and the
+    # tool index, none of which this auth-exempt route needs, and the globals it
+    # installs leak into later tests (an agent-loop turn that follows this test
+    # then stops for exact-approval and never reaches its second round).
+    payload = TestClient(app).get("/api/version").json()
 
     assert set(payload) >= {"version", "build", "source_commit"}
     # Absent values are reported as "unknown", never omitted or null, which is

@@ -10,6 +10,8 @@
   <a href="#quick-start">Quick Start</a> ·
   <a href="website/setup.md">Setup Guide</a> ·
   <a href="website/providers-auto-council.md">Providers / Auto / Council</a> ·
+  <a href="docs/CHATBOX_AI.md">Chatbox AI</a> ·
+  <a href="docs/KEY_POOL.md">Key rotation</a> ·
   <a href="CONTRIBUTING.md">Contributing</a> ·
   <a href="ROADMAP.md">Roadmap</a>
 </p>
@@ -50,6 +52,9 @@ Native installs, GPU notes, Windows/macOS instructions, HTTPS, and configuration
 ## Features
 
 - **Chat + Agents** — local/API models, tools, MCP, files, shell, skills, and memory.
+- **Bring your own keys** — provider onboarding, Chatbox AI license keys, Auto routing and a
+  Council of models; an endpoint can hold a whole pool of keys and rotate to the next one when a
+  key is rate-limited or out of quota, continuing the same answer mid-sentence.
 - **Cookbook** — hardware-aware model recommendations, downloads, and serving.
 - **Deep Research** — multi-step web research with source reading and report generation.
 - **Compare** — blind side-by-side model testing and synthesis.

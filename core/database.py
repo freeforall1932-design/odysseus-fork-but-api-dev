@@ -609,6 +609,60 @@ class ProviderAuthSession(TimestampMixin, Base):
     last_refresh = Column(DateTime, nullable=True)
     auth_mode = Column(String, nullable=True)
 
+class ProviderKey(TimestampMixin, Base):
+    """Extra API credentials for one model endpoint (downstream key pool).
+
+    A ``ModelEndpoint.api_key`` is the primary credential. These rows are the
+    additional keys of the *same* provider, so a rate-limited or exhausted key
+    can be rotated to the next one without changing the route. Keys are
+    encrypted at rest with ``EncryptedText``; ``key_fingerprint`` is a
+    non-secret SHA-256 id used for lookups and for attributing failures.
+
+    Runtime health (cooldowns, failure streaks, usage counters) is deliberately
+    NOT stored here: it lives in ``src/key_pool.py`` process memory so the chat
+    path never writes to the database just to rotate a credential.
+    """
+
+    __tablename__ = "provider_keys"
+
+    id = Column(String, primary_key=True, index=True)
+    endpoint_id = Column(String, nullable=False, index=True)
+    owner = Column(String, nullable=True, index=True)
+    label = Column(String, nullable=True)
+    api_key = Column(EncryptedText, nullable=False)
+    key_fingerprint = Column(String, nullable=False, index=True)
+    is_enabled = Column(Boolean, default=True, nullable=False)
+    # Lower number = tried first. Ties fall back to least-recently-used, so a
+    # pool with equal priorities behaves like round-robin under load.
+    priority = Column(Integer, default=0, nullable=False)
+
+
+class ChatboxAILicense(TimestampMixin, Base):
+    """Activated Chatbox AI license (chatboxai.app) for one owner.
+
+    The license key and its activated instance id are both encrypted at rest
+    via ``EncryptedText``. ``key_fingerprint`` is a non-secret SHA-256 lookup
+    id so request-header building can find the instance id without decrypting
+    every row. One active row per owner; older keys are marked inactive when a
+    new one is activated.
+    """
+
+    __tablename__ = "chatbox_ai_licenses"
+
+    id = Column(String, primary_key=True, index=True)
+    owner = Column(String, nullable=True, index=True)
+    label = Column(String, nullable=True)
+    license_key = Column(EncryptedText, nullable=False)
+    key_fingerprint = Column(String, nullable=False, index=True)
+    instance_id = Column(EncryptedText, nullable=True)
+    instance_name = Column(String, nullable=True)
+    plan = Column(String, nullable=True)
+    status = Column(String, nullable=True)
+    detail = Column(EncryptedText, nullable=True)   # JSON from /api/license/detail
+    is_active = Column(Boolean, default=True, nullable=False)
+    last_checked = Column(DateTime, nullable=True)
+
+
 class McpServer(TimestampMixin, Base):
     """Admin-configured MCP (Model Context Protocol) tool servers."""
     __tablename__ = "mcp_servers"

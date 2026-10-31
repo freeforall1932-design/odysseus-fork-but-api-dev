@@ -172,10 +172,12 @@ def setup_compare_routes(session_manager: SessionManager):
                 session_endpoint_url = (
                     build_chat_url(normalize_base(ep.base_url)) if ep is not None else endpoint
                 )
-                # Headers come only from a matched endpoint's key; None when
-                # `ep` is None (raw admin URL or no match), so a comparison can
-                # never inherit another user's key/headers.
-                headers = build_headers(ep.api_key, ep.base_url) if (ep and ep.api_key) else None
+                # Headers come only from a matched endpoint (never a raw admin
+                # URL or another user's row). Built even when the row has no
+                # api_key, because protocol-level headers (Chatbox AI's
+                # Instance-Id, anthropic-version) are keyless; an empty result
+                # still collapses to None so nothing is inherited.
+                headers = (build_headers(ep.api_key or "", ep.base_url) or None) if ep else None
                 resolved.append((sid, model, session_endpoint_url, headers))
         finally:
             db.close()

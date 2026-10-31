@@ -7,6 +7,7 @@ import json
 import hashlib
 import ipaddress
 import socket
+import secrets
 import time as _time
 import logging
 import threading
@@ -658,7 +659,7 @@ _NON_CHAT_CONTAINS = (
     "gliner", "riva", "-parse", "-embedqa", "-nemoretriever",
     "topic-control", "calibration",
     "ai-synthetic-video", "cosmos-reason2",
-    "bge", "llama-guard",
+    "bge", "llama-guard", "-embed", "rerank",
 )
 _NON_CHAT_EXACT_PREFIXES = (
     "gpt-audio",  # gpt-audio, gpt-audio-mini etc. (not gpt-4o-audio-preview which is chat)
@@ -1036,11 +1037,10 @@ def _probe_endpoint(base_url: str, api_key: str = None, timeout: int = 5) -> Lis
             logger.warning(f"Google native models probe failed: {e}")
         return []
     if provider == "anthropic":
-        # Try Anthropic's /v1/models endpoint first
+        # Try Anthropic's /v1/models endpoint first. build_headers also adds
+        # Chatbox's Instance-Id when the base is its Anthropic gateway.
         url = _safe_build_models_url(base)
-        headers = {"anthropic-version": "2023-06-01"}
-        if api_key:
-            headers["x-api-key"] = api_key
+        headers = _safe_build_headers(api_key, base)
         try:
             r = httpx.get(url, headers=headers, timeout=timeout, verify=llm_verify())
             r.raise_for_status()
@@ -1401,6 +1401,19 @@ def _visible_models(cached_models, hidden_models, pinned_models=None):
 
 def _picker_requires_pinning(base_url: str, kind: str) -> bool:
     return _classify_endpoint(base_url, kind) == "api"
+
+
+def _first_default_model(model_ids, pinned) -> str:
+    """Default model for a newly created endpoint.
+
+    Live ``/models`` results win. Otherwise use the first pinned id: connect
+    flows that skip the probe (Chatbox AI license gateways, other catalog-only
+    providers) carry their whole catalog as pins, and an empty default would
+    leave the first-run picker pointing at nothing.
+    """
+    from src.endpoint_resolver import _first_chat_model
+
+    return _first_chat_model(model_ids) or (pinned[0] if pinned else "")
 
 
 def _has_explicit_pinned_models(ep) -> bool:
@@ -2380,9 +2393,8 @@ def setup_model_routes(model_discovery):
                 current_default_endpoint=current_default_ep,
                 current_default_model=settings.get("default_model") or "",
             ):
-                from src.endpoint_resolver import _first_chat_model
                 settings["default_endpoint_id"] = ep.id
-                settings["default_model"] = _first_chat_model(model_ids) or ""
+                settings["default_model"] = _first_default_model(model_ids, _pinned)
                 _save_settings(settings)
             _invalidate_models_cache()
             _local_probe_cache["data"] = None
@@ -2845,11 +2857,12 @@ def setup_model_routes(model_discovery):
                 return {"endpoint_id": "", "endpoint_url": "", "model": ""}
             base = _normalize_base(ep.base_url)
             chat_url = build_chat_url(base)
+            if model and not _is_chat_model(model):
+                model = ""
             if not model and (getattr(ep, "cached_models", None) or getattr(ep, "pinned_models", None)):
                 try:
                     visible = _visible_models(ep.cached_models, getattr(ep, "hidden_models", None), getattr(ep, "pinned_models", None))
-                    if visible:
-                        model = visible[0]
+                    model = next((mid for mid in visible if _is_chat_model(mid)), "")
                 except Exception:
                     pass
             return {"endpoint_id": ep.id, "endpoint_url": chat_url, "model": model}
@@ -3091,6 +3104,12 @@ def setup_model_routes(model_discovery):
     def update_tools(body: ToolsUpdate, request: Request):
         """Update which tools are disabled."""
         require_admin(request)
+        from core.middleware import INTERNAL_TOOL_HEADER, INTERNAL_TOOL_TOKEN
+        internal_token = request.headers.get(INTERNAL_TOOL_HEADER)
+        if internal_token and secrets.compare_digest(internal_token, INTERNAL_TOOL_TOKEN):
+            # Owner impersonation can carry an admin username, so check the
+            # authenticated transport rather than request.state.current_user.
+            raise HTTPException(403, "Change tool policy in Settings > Agent Tools, not from chat")
         settings = _load_settings()
         settings["disabled_tools"] = body.disabled
         _save_settings(settings)

@@ -145,6 +145,8 @@ credit:
 - [tmux](https://github.com/tmux/tmux) — terminal multiplexer; Cookbook shells out to it on Linux/macOS for background model downloads and serves (ISC)
 - [OpenSSH](https://www.openssh.com/) (`ssh`, `ssh-keygen`, `ssh-copy-id`) — Cookbook shells out to it to manage remote model servers and provision keys (BSD-style permissive)
 - Model/API providers: Anthropic, OpenAI, Google (Gemini), DuckDuckGo
+- [Chatbox AI](https://chatboxai.app) — hosted model gateway used with a user-supplied license key. API compatibility
+  only: no Chatbox code is bundled or redistributed.
 
 ---
 

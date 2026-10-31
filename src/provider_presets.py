@@ -50,6 +50,12 @@ PRESETS: tuple = (
         guard_note="Pace to daily cap (50/day is only a few turns); reserve for short calls unless $10 purchased.",
     ),
     ProviderPreset(
+        "chatboxai", "Chatbox AI", "https://api.chatboxai.app/gateway/openai/v1",
+        flavor="chatboxai", key_url="https://chatboxai.app",
+        note="Subscription from chatboxai.app: paste your license key. Claude models use Chatbox's Anthropic gateway; Gemini and Responses models are listed but not callable from Odysseus yet.",
+        free_evidence="conditional", guard_note="One license backs the whole server; chat quota is per plan.",
+    ),
+    ProviderPreset(
         "google", "Google Gemini", "https://generativelanguage.googleapis.com/v1beta/openai",
         flavor="google", key_prefixes=("AIza",), key_url="https://aistudio.google.com/apikey",
         note="Free tier exists for Flash-class models only (per-model pricing page); exact limits are login-only in AI Studio (per project, RPD midnight PT). Unpaid use may be used for training.",
@@ -174,6 +180,11 @@ class ModelCard:
     tools: Optional[bool] = None
     reasoning: Optional[bool] = None
     local: bool = False
+    # Chatbox AI exposes several gateway protocols. Cards carry the protocol so
+    # the provider dialog can register one endpoint per gateway and skip models
+    # Odysseus cannot call yet (Gemini native / OpenAI Responses).
+    api_style: Optional[str] = None
+    supported: Optional[bool] = None
 
 
 class DiscoveryError(Exception):
@@ -459,6 +470,63 @@ _FETCHERS = {
 }
 
 
+async def _discover_chatbox(
+    preset: ProviderPreset,
+    key: str,
+    base: str,
+    client: httpx.AsyncClient,
+    timeout: float,
+) -> Discovery:
+    """Chatbox AI: activate the license, read plan/quota, list plan models.
+
+    Chatbox's catalog is *not* an OpenAI ``/v1/models`` list, so it bypasses
+    the generic fetchers. ``key_info`` carries the activation result for the
+    route layer (it stores the encrypted license and strips the private keys
+    before responding to the browser).
+    """
+    from src import chatbox_ai
+
+    try:
+        found = await chatbox_ai.discover(
+            key,
+            client=client,
+            base_url=base,
+            timeout=timeout,
+        )
+    except chatbox_ai.ChatboxError as exc:
+        raise DiscoveryError(exc.message, exc.status)
+
+    cards = [
+        ModelCard(
+            id=model["id"],
+            name=model.get("name") or model["id"],
+            context_length=model.get("context_length"),
+            vision=model.get("vision"),
+            tools=model.get("tools"),
+            reasoning=model.get("reasoning"),
+            api_style=model.get("api_style"),
+            supported=model.get("supported"),
+        )
+        for model in found.get("models", [])
+        if isinstance(model, dict) and model.get("id")
+    ]
+    key_info = {
+        "provider": "chatboxai",
+        "masked_key": found.get("masked_key", ""),
+        "summary": found.get("summary") or {},
+        "plan": (found.get("summary") or {}).get("plan", ""),
+        "license_detail": found.get("license_detail"),
+        "license_detail_error": found.get("license_detail_error"),
+        "instance_id": found.get("instance_id", ""),
+        "instance_name": found.get("instance_name", ""),
+        "api_origin": found.get("api_origin", ""),
+        "catalog_source": found.get("catalog_source", ""),
+        "variants": found.get("variants") or [],
+        "unsupported": found.get("unsupported") or [],
+    }
+    return Discovery(cards=cards, key_info=key_info)
+
+
 async def discover(
     preset_id: str,
     api_key: str = "",
@@ -478,7 +546,8 @@ async def discover(
         raise DiscoveryError(f"Unknown provider '{preset_id}'.")
     key = (api_key or "").strip()
     if preset.needs_key and not key:
-        raise DiscoveryError(f"Paste your {preset.label} API key first.")
+        what = "license key" if preset.flavor == "chatboxai" else "API key"
+        raise DiscoveryError(f"Paste your {preset.label} {what} first.")
     base = (base_url or preset.base_url or "").strip()
     if not base:
         raise DiscoveryError("A base URL is required for this provider.")
@@ -503,6 +572,9 @@ async def discover(
         client = httpx.AsyncClient(timeout=timeout, verify=verify, follow_redirects=False)
     key_info: Optional[Dict[str, Any]] = None
     try:
+        if preset.flavor == "chatboxai":
+            # Chatbox owns its catalog + license endpoints; generic /models does not exist.
+            return await _discover_chatbox(preset, key, base, client, timeout)
         if preset.flavor == "openrouter" and key:
             key_info = await _openrouter_key_info(client, base, key)  # fail fast on a bad key
         cards = await fetch(client, preset, base, key)

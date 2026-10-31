@@ -422,7 +422,18 @@ def _stream_delta_event(text: str, *, thinking: bool = False) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
 
-_DEGENERATE_WORD_RE = re.compile(r"[A-Za-z0-9_\u0370-\u03ff\u0400-\u04ff]+")
+_WORD_CHARS = r"A-Za-z0-9_\u0370-\u03ff\u0400-\u04ff"
+_DELIM_RE = re.compile(rf"[^{_WORD_CHARS}+\-.]")
+_NUMERIC_PATTERN = rf"(?<![{_WORD_CHARS}])[+-]?(?:[0-9]+\.[0-9]+|\.[0-9]+|[0-9]+)(?:[eE][+-]?[0-9]+)?(?![{_WORD_CHARS}])"
+_NUMERIC_FULLMATCH_RE = re.compile(rf"^[+-]?(?:[0-9]+\.[0-9]+|\.[0-9]+|[0-9]+)(?:[eE][+-]?[0-9]+)?$")
+_DEGENERATE_WORD_RE = re.compile(rf"[{_WORD_CHARS}]+")
+_TOKEN_RE = re.compile(rf"(?P<NUM>{_NUMERIC_PATTERN})|(?P<WORD>[{_WORD_CHARS}]+)")
+
+
+def _is_numeric_token(token: str) -> bool:
+    if token.isdigit():
+        return True
+    return _NUMERIC_FULLMATCH_RE.fullmatch(token) is not None
 
 
 class _DegenerateStreamGuard:
@@ -432,32 +443,50 @@ class _DegenerateStreamGuard:
     "Summer Summer ..."). This is not a useful response and can burn context,
     browser memory, and GPU time. Keep the guard conservative: only fire on long
     same-token runs or a very dominant repeated token in the recent window.
+    Repetition made only of numbers is data (a zero or identity matrix, a
+    padded buffer), so it only stops at a long all-numeric backstop.
     """
 
     def __init__(self, model: str):
         self.model = model or "model"
         self.last_token = ""
         self.same_run = 0
+        self.numeric_run = 0
         self.recent_tokens: List[str] = []
         self.periodic_tokens: List[str] = []
         self.total_chars = 0
+        self._buffer = ""
 
     def check(self, text: str) -> Optional[str]:
         if not text:
             return None
         self.total_chars += len(text)
-        # Keep one-character tokens. Structured output often varies through
-        # numeric selectors or coordinates; dropping those tokens can make
-        # valid CSS/SVG rows look like an exact repeated phrase.
-        tokens = [t.lower() for t in _DEGENERATE_WORD_RE.findall(text)]
+        self._buffer += text
+
+        m_delims = list(_DELIM_RE.finditer(self._buffer))
+        if m_delims:
+            split_idx = m_delims[-1].end()
+            head = self._buffer[:split_idx]
+            self._buffer = self._buffer[split_idx:]
+        elif len(self._buffer) >= 256:
+            head = self._buffer
+            self._buffer = ""
+        else:
+            return None
+
+        tokens = []
+        for m in _TOKEN_RE.finditer(head):
+            tokens.append((m.group(0).lower(), m.lastgroup == "NUM"))
         if not tokens:
             return None
-        for token in tokens:
+
+        for token, is_num in tokens:
             if token == self.last_token:
                 self.same_run += 1
             else:
                 self.last_token = token
                 self.same_run = 1
+            self.numeric_run = self.numeric_run + 1 if is_num else 0
             self.recent_tokens.append(token)
             self.periodic_tokens.append(token)
         if len(self.recent_tokens) > 96:
@@ -466,14 +495,20 @@ class _DegenerateStreamGuard:
             self.periodic_tokens = self.periodic_tokens[-2048:]
 
         reason = None
-        if self.same_run >= 28 and self.total_chars >= 100:
+        if self.same_run >= 28 and self.total_chars >= 100 and not _is_numeric_token(self.last_token):
             reason = f"repeated '{self.last_token}' {self.same_run} times"
         elif len(self.recent_tokens) >= 72:
             top = max(set(self.recent_tokens), key=self.recent_tokens.count)
             count = self.recent_tokens.count(top)
-            if count >= 60 and count / max(len(self.recent_tokens), 1) >= 0.78:
+            if count >= 60 and count / max(len(self.recent_tokens), 1) >= 0.78 and not _is_numeric_token(top):
                 reason = f"repeated '{top}' {count}/{len(self.recent_tokens)} recent tokens"
-        if not reason and len(self.recent_tokens) >= 48:
+        if (
+            not reason
+            and len(self.recent_tokens) >= 48
+            # A window that is mostly numbers is matrix/table data; its
+            # periodicity is real. Mixed loops still hit the exact-block check.
+            and sum(_is_numeric_token(t) for t in self.recent_tokens) * 2 < len(self.recent_tokens)
+        ):
             # Detect a periodic suffix instead of counting repeated n-grams.
             # Reused property names are normal in CSS/SVG/JSON; a collapsed
             # generation repeats nearly every token at a short fixed period.
@@ -508,11 +543,14 @@ class _DegenerateStreamGuard:
                 if history[previous:previous + anchor_size] != anchor:
                     continue
                 period = current_anchor - previous
-                if period < 24 or len(history) < period * 2:
+                if period < 24 or len(history) < period * 2 or self.numeric_run >= period:
                     continue
-                if history[-2 * period:-period] == history[-period:]:
+                if history[-2 * period:-period] == history[-period:] and not all(_is_numeric_token(t) for t in history[-period:]):
                     reason = f"repeated an exact {period}-token block twice"
                     break
+
+        if not reason and self.numeric_run >= 2048:
+            reason = f"emitted {self.numeric_run} numbers in a row"
 
         if not reason:
             return None
@@ -1077,6 +1115,15 @@ def _detect_provider(url: str) -> str:
     """
     if _is_ollama_native_url(url):
         return "ollama"
+    try:
+        from src.chatbox_ai import is_chatbox_anthropic_url
+
+        # Chatbox AI's Claude gateway speaks the Anthropic Messages API even
+        # though its hostname is not anthropic.com.
+        if is_chatbox_anthropic_url(url):
+            return "anthropic"
+    except Exception:  # pragma: no cover - optional import
+        pass
     if _host_match(url, "anthropic.com"):
         return "anthropic"
     if _host_match(url, "opencode.ai/zen/go"):
@@ -1339,6 +1386,11 @@ def _provider_label(url: str) -> str:
     if _host_match(url, "deepseek.com"): return "DeepSeek"
     if _host_match(url, "nvidia.com"): return "NVIDIA"
     if _host_match(url, "googleapis.com"): return "Google"
+    try:
+        from src.chatbox_ai import is_chatbox_url
+        if is_chatbox_url(url): return "Chatbox AI"
+    except Exception:  # pragma: no cover - optional import
+        pass
     if _host_match(url, "together.xyz", "together.ai"): return "Together"
     if _host_match(url, "fireworks.ai"): return "Fireworks"
     if _host_match(url, "kimi.com"):
@@ -1556,8 +1608,9 @@ def _build_chatgpt_responses_payload(
         "stream": stream,
         "store": False,
     }
-    if not _restricts_temperature(model):
-        payload["temperature"] = temperature
+    # ChatGPT plan Responses requests reject temperature for every model.
+    # The common caller still passes its preset value, but this provider must
+    # omit the field even for model names outside the known reasoning families.
     # ChatGPT Subscription Codex API does not support max_output_tokens —
     # passing it returns HTTP 400 "Unsupported parameter: max_output_tokens".
     # Do not include it in the payload.
@@ -2600,6 +2653,64 @@ async def llm_call_async_with_route_fallback(
     raise HTTPException(503, "All fallback candidates failed")
 
 
+def _rotate_nonstream_key(headers, url, response, tried):
+    """Next credential's headers after a key-scoped HTTP failure, or None."""
+    try:
+        from src import key_pool
+    except Exception:  # pragma: no cover
+        return None
+    body = ""
+    retry_after = None
+    try:
+        body = response.text or ""
+    except Exception:
+        body = ""
+    try:
+        retry_after = key_pool.parse_retry_after(
+            (response.headers or {}).get("retry-after")
+            if response is not None else None
+        )
+    except Exception:
+        retry_after = None
+    try:
+        current = key_pool.current_key(headers)
+        rotated = key_pool.rotate_headers(
+            headers, url, status=response.status_code, body=body,
+            retry_after=retry_after, tried=tried,
+        )
+    except Exception:  # pragma: no cover
+        logger.debug("non-stream key rotation failed", exc_info=True)
+        return None
+    if rotated and current:
+        tried.append(current)
+    return rotated
+
+
+def _note_key_failure(headers, url, status, message=""):
+    """Record a provider error that arrived inside a 200 response."""
+    try:
+        from src import key_pool
+
+        current = key_pool.current_key(headers)
+        endpoint_id = key_pool.endpoint_for_key(current) if current else None
+        if endpoint_id:
+            key_pool.record_failure(endpoint_id, current, status=status, body=message)
+    except Exception:  # pragma: no cover
+        logger.debug("key failure accounting failed", exc_info=True)
+
+
+def _note_key_success(headers, url):
+    try:
+        from src import key_pool
+
+        current = key_pool.current_key(headers)
+        endpoint_id = key_pool.endpoint_for_key(current) if current else None
+        if endpoint_id:
+            key_pool.record_success(endpoint_id, current)
+    except Exception:  # pragma: no cover
+        logger.debug("key success accounting failed", exc_info=True)
+
+
 async def llm_call_async(
     url: str,
     model: str,
@@ -2778,6 +2889,7 @@ async def llm_call_async(
         raise HTTPException(503, f"Upstream {_host_key(target_url)} marked unreachable (cooldown active)")
 
     call_timeout = _call_timeout(timeout)
+    tried_keys: List[str] = []
     attempt = 0
     while attempt < max_retries:
         attempt += 1
@@ -2794,6 +2906,14 @@ async def llm_call_async(
                     f"LLM async call to {target_url} failed in {duration:.2f}s "
                     f"(attempt {attempt}): HTTP {r.status_code} {friendly}"
                 )
+                # A rate-limited or exhausted key is not a reason to stop: the
+                # pool hands the same request to the next key of this endpoint.
+                rotated = _rotate_nonstream_key(
+                    h, target_url, r, tried_keys,
+                )
+                if rotated is not None and attempt < max_retries:
+                    h = rotated
+                    continue
                 if r.status_code in (429, 502, 503, 504) and attempt < max_retries:
                     await asyncio.sleep(LLMConfig.RETRY_DELAY)
                     continue
@@ -2808,7 +2928,11 @@ async def llm_call_async(
                     detail = provider_error.get("message") or provider_error.get("type") or str(provider_error)
                 else:
                     detail = str(provider_error)
+                # Some providers answer 200 with an error body. That is still a
+                # failed key, not a success: account for it before raising.
+                _note_key_failure(h, target_url, status, detail)
                 raise HTTPException(status, detail or "Upstream request failed")
+            _note_key_success(h, target_url)
             try:
                 reported_model = data.get("model") if isinstance(data, dict) else None
                 actual_model = (
@@ -2930,30 +3054,158 @@ def _stream_target_url(url: str) -> str:
     return _normalize_openai_chat_url(url)
 
 
+def _stream_error_payload(chunk: str):
+    """Status + message of an ``event: error`` SSE chunk, if it is one."""
+    if not isinstance(chunk, str) or not chunk.startswith("event: error"):
+        return None, ""
+    for line in chunk.splitlines():
+        if not line.startswith("data:"):
+            continue
+        try:
+            payload = json.loads(line[5:].strip())
+        except (TypeError, ValueError):
+            return None, ""
+        if not isinstance(payload, dict):
+            return None, ""
+        raw_status = payload.get("status") or payload.get("status_code") or payload.get("http_status")
+        try:
+            status = int(raw_status) if raw_status is not None else None
+        except (TypeError, ValueError):
+            status = None
+        message = str(payload.get("error") or payload.get("text") or "")
+        return status, message
+    return None, ""
+
+
+def _stream_delta_text(chunk: str) -> str:
+    """Visible text carried by one SSE chunk (empty for any other event)."""
+    if not isinstance(chunk, str) or not chunk.startswith("data: "):
+        return ""
+    body = chunk[6:].strip()
+    if not body or body.startswith("[DONE]"):
+        return ""
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    delta = payload.get("delta")
+    return delta if isinstance(delta, str) else ""
+
+
 async def stream_llm(url: str, model: str, messages: List[Dict], temperature: float = LLMConfig.DEFAULT_TEMPERATURE,
                      max_tokens: int = LLMConfig.DEFAULT_MAX_TOKENS, headers: Optional[Dict] = None,
                      timeout: int = LLMConfig.STREAM_TIMEOUT, prompt_type: Optional[str] = None,
                      tools: Optional[List[Dict]] = None, session_id: Optional[str] = None,
                      tool_choice_none: bool = False, workload: str = "foreground",
                      thinking_mode: Optional[str] = None, reasoning_effort: Optional[str] = None):
+    """Stream one completion, rotating the API key when the provider rejects it.
+
+    Two cases, both invisible when they work:
+
+    * **Before any output** — the request is simply re-run on the next key.
+    * **Mid-answer** — the partial text is handed back as an assistant prefix so
+      the next key *continues the same sentence* instead of restarting. Some
+      providers reject a prefilled assistant turn; that retry then fails with a
+      4xx before producing anything, and the original error is emitted exactly
+      as it would have been without rotation.
+
+    Continuations are capped per request so a provider that always fails fast
+    cannot loop.
+    """
     target_url = _stream_target_url(url)
-    async with _local_model_slot(target_url, model, workload):
-        async for chunk in _stream_llm_inner(
+    active_headers = dict(headers) if headers else headers
+    tried_keys: List[str] = []
+    call_messages = messages
+    partial_text = ""
+    tool_emitted = False
+    continuations = 0
+    max_continuations = 3
+
+    while True:
+        rotated = False
+        async with _local_model_slot(target_url, model, workload):
+            async for chunk in _stream_llm_inner(
+                url,
+                model,
+                call_messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                headers=active_headers,
+                timeout=timeout,
+                prompt_type=prompt_type,
+                tools=tools,
+                session_id=session_id,
+                tool_choice_none=tool_choice_none,
+                thinking_mode=thinking_mode,
+                reasoning_effort=reasoning_effort,
+            ):
+                status, message = _stream_error_payload(chunk)
+                if status is not None:
+                    # Nothing shown yet, or the answer stopped mid-sentence: both
+                    # are recoverable on another key. A partial tool-call stream
+                    # is not: restarting it would double-execute tools.
+                    can_resume = (
+                        bool(partial_text)
+                        and not tool_emitted
+                        and continuations < max_continuations
+                    )
+                    can_restart = not partial_text and not tool_emitted
+                    if can_resume or can_restart:
+                        rotated_headers = _rotate_stream_key(
+                            active_headers, url, status, message, tried_keys,
+                        )
+                        if rotated_headers is not None:
+                            active_headers = rotated_headers
+                            rotated = True
+                            if can_resume:
+                                continuations += 1
+                                call_messages = _continuation_messages(messages, partial_text)
+                            break
+                if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
+                    body = chunk[6:].strip()
+                    if '"tool_calls"' in body or '"type": "tool' in body:
+                        tool_emitted = True
+                delta = _stream_delta_text(chunk)
+                if delta:
+                    partial_text += delta
+                yield chunk
+        if not rotated:
+            return
+
+
+def _rotate_stream_key(active_headers, url, status, message, tried_keys):
+    """New headers for the same request after a key-scoped stream failure."""
+    try:
+        from src import key_pool
+
+        current = key_pool.current_key(active_headers)
+        rotated = key_pool.rotate_headers(
+            active_headers,
             url,
-            model,
-            messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            headers=headers,
-            timeout=timeout,
-            prompt_type=prompt_type,
-            tools=tools,
-            session_id=session_id,
-            tool_choice_none=tool_choice_none,
-            thinking_mode=thinking_mode,
-            reasoning_effort=reasoning_effort,
-        ):
-            yield chunk
+            status=status,
+            body=message,
+            tried=tried_keys,
+        )
+    except Exception:  # pragma: no cover - rotation must never break streaming
+        logger.debug("stream key rotation failed", exc_info=True)
+        return None
+    if not rotated:
+        return None
+    if current:
+        tried_keys.append(current)
+    logger.info("key pool: retried stream on a fresh key (status=%s)", status)
+    return rotated
+
+
+def _continuation_messages(messages: List[Dict], partial_text: str) -> List[Dict]:
+    """Same conversation with the partial answer pre-filled as the assistant turn.
+
+    Exactly the text the user has already seen is sent back — trimming a
+    half-written word would make the resumed answer repeat it.
+    """
+    return list(messages) + [{"role": "assistant", "content": partial_text}]
 
 
 async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperature: float = LLMConfig.DEFAULT_TEMPERATURE,

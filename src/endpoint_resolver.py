@@ -173,7 +173,10 @@ def resolve_endpoint_runtime(ep, owner: Optional[str] = None) -> Tuple[str, Opti
 
     Static-key providers use ``ModelEndpoint.api_key``. Session-backed providers
     store refreshable credentials in ProviderAuthSession and must resolve a
-    current access token at call time.
+    current access token at call time. Endpoints with a key pool return the next
+    healthy credential, which is what makes rotation happen for every caller
+    (chat, agent tools, background tasks, research, webhooks) without each one
+    knowing about it.
     """
     base = _rewrite_docker_host_for_native_runtime(
         normalize_base(getattr(ep, "base_url", "") or "")
@@ -188,7 +191,29 @@ def resolve_endpoint_runtime(ep, owner: Optional[str] = None) -> Tuple[str, Opti
             normalize_base(creds.get("base_url") or base)
         )
         api_key = creds.get("api_key")
+    else:
+        pooled = _pooled_key(getattr(ep, "id", None), api_key)
+        if pooled:
+            api_key = pooled
     return base, api_key
+
+
+def _pooled_key(endpoint_id: Optional[str], primary: Optional[str] = None) -> Optional[str]:
+    """Next healthy key from the endpoint's pool, or None to keep the primary.
+
+    The row's own key is handed in so a key the user just removed or replaced is
+    never served from a cache. Failure-proof: a broken pool must never stop a
+    chat from starting.
+    """
+    if not endpoint_id:
+        return None
+    try:
+        from src.key_pool import pick_key
+
+        return pick_key(str(endpoint_id), primary=primary)
+    except Exception:  # pragma: no cover - pool must never break routing
+        logger.debug("key pool selection failed for %s", endpoint_id, exc_info=True)
+        return None
 
 
 # Cache for Tailscale hostname → IP resolution
@@ -362,6 +387,15 @@ def _anthropic_api_root(base: str) -> str:
     base = (base or "").strip().rstrip("/")
     if _host_match(base, "anthropic.com") and base.endswith("/v1"):
         return base[:-3].rstrip("/")
+    try:
+        from src.chatbox_ai import is_chatbox_anthropic_url
+
+        # Chatbox's Anthropic gateway mirrors Anthropic's /v1 shape. Strip /v1
+        # here so build_chat_url/_normalize_anthropic_url re-add exactly one.
+        if is_chatbox_anthropic_url(base) and base.endswith("/v1"):
+            return base[:-3].rstrip("/")
+    except Exception:  # pragma: no cover - import failure must not break routing
+        pass
     return base
 
 
@@ -412,14 +446,30 @@ def build_models_url(base: str) -> Optional[str]:
     return _append_endpoint_path(base, "/models")
 
 
+def _chatbox_extra_headers(api_key: Optional[str], base: str) -> Dict[str, str]:
+    """Chatbox AI gateway headers (Instance-Id) for a stored license, if any.
+
+    Cheap and failure-proof: the lookup is process-cached and *never* performs
+    network I/O, so header building cannot slow down or break a chat turn.
+    """
+    try:
+        from src.chatbox_ai import auth_headers
+
+        return auth_headers(api_key, base)
+    except Exception:  # pragma: no cover - never break request building
+        return {}
+
+
 def build_headers(api_key: Optional[str], base: str) -> Dict[str, str]:
     """Build auth headers for an endpoint."""
     provider = _detect_provider(base)
     headers: Dict[str, str] = {}
+    extra = _chatbox_extra_headers(api_key, base)
     if provider == "anthropic":
         if api_key:
             headers["x-api-key"] = api_key
         headers["anthropic-version"] = "2023-06-01"
+        headers.update(extra)
         return headers
     if provider == "copilot":
         from src.copilot import copilot_headers
@@ -434,6 +484,7 @@ def build_headers(api_key: Optional[str], base: str) -> Dict[str, str]:
         headers.setdefault("X-OpenRouter-Title", "Odysseus")
     if _is_kimi_code_url(base):
         headers.setdefault("User-Agent", KIMI_CODE_USER_AGENT)
+    headers.update(extra)
     return headers
 
 

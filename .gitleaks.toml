@@ -1,4 +1,4 @@
-# Gitleaks configuration: the built-in default rules plus three narrow exceptions.
+# Gitleaks configuration: the built-in default rules plus five narrow exceptions.
 #
 # THIRD_PARTY_PROVENANCE.json keys its transitive npm notices by
 # "<package>_<version>" ("key": "inherits_2.0.4"). Four of those identifiers
@@ -35,6 +35,18 @@ regexes = [
   '''^7abc5b334a6c3c52dd3eba15d8bc516da728a67f14fb7f56d0bb5992d89a16ca$''',
 ]
 
+[[allowlists]]
+description = "Synthetic dummy API key in trace artifact sanitizer test fixture"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = [
+  '''(?:^|/)tests/test_trace_artifact_sanitizer\.py$''',
+]
+regexTarget = "secret"
+regexes = [
+  '''^sk-123456789$''',
+]
+
 # Downstream (this repository only): a placeholder string that lives in this
 # repository's *history*. Commits c605cbfc and 4001952f carried a test fixture
 # asserting that provider error messages never echo the caller's API key. The
@@ -42,10 +54,23 @@ regexes = [
 # generic-api-key rule, and `gitleaks git` scans history, so correcting the
 # current tree (done) does not clear the scan on its own. The regex is anchored
 # to the exact literal and cannot mask anything else.
-
 [[allowlists]]
 description = "Historical downstream test fixture placeholder (not a credential)"
+targetRules = ["generic-api-key"]
 regexTarget = "secret"
 regexes = [
   '''^sk-LEAKTEST-123456$''',
+]
+
+# Downstream (this repository only): the replaceable Chatbox AI licence fixture
+# in tests/test_provider_chatbox_routes.py used to be the literal below. The test
+# mocks the HTTP layer, so it was never a usable credential, and the fixture is
+# now letters-only; but the old literal still sits in commits 05299dd1 and
+# 76023907 and `gitleaks git` scans history. Anchored to that exact string only.
+[[allowlists]]
+description = "Historical Chatbox AI test licence fixture (not a credential)"
+targetRules = ["generic-api-key"]
+regexTarget = "secret"
+regexes = [
+  '''^cbx-route-test-key-abcdef123456$''',
 ]
