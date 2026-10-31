@@ -63,14 +63,22 @@ but using only Odysseus's existing endpoint/encryption layers.
 
 ## Latest session — key rotation (BYOR pool) and upstream sync (2026-10-31)
 
+**Worklist.** `WORKLIST.md` now opens with the tracks derived from the 2026-10-31 Q&A: **A** in-app
+agent team (ChatDev-inspired, A1–A9), **B** key-rotation follow-ups (B1–B6), **C** upstream sync,
+**D** Chatbox follow-ups. The security audit was kept intact below it.
+
 **Upstream sync.** `source/dev` @ `516f046f` (191 commits) is merged into the branch as merge commit
-`19c52bc0`. Only `.gitleaks.toml` and `static/sw.js` conflicted; both resolved by the manifest rules
-(upstream allowlist kept + downstream historical fixture re-appended; upstream `CACHE_NAME`
+`19c52bc0`; after the owner fast-forwarded the fork, `source/dev` @ `ef3467e8` (10 commits) was merged
+as `515ae4a6` with no conflicts (the upstream model-routing fixes compose with `_first_default_model`).
+
+In the first merge only `.gitleaks.toml` and `static/sw.js` conflicted; both resolved by the manifest
+rules (upstream allowlist kept + downstream historical fixture re-appended; upstream `CACHE_NAME`
 `odysseus-v1115-pr40-editor-precache` bumped to `...-providerhub`). Every Chatbox hook survived in the
-auto-merged upstream files. Gate: `upstream_sync.py --check-only` 27/27, 485 tests, app boots on
-`0.0.0.0:7011`, `/api/providers/*` and `/api/auto/pool` answer 401 (registered behind auth).
-**The mirror fork is 10 commits behind `odysseus-dev/dev`** and `gh repo sync` returns HTTP 403 from
-this sandbox — those ten commits are still outstanding; the owner must sync the fork.
+auto-merged upstream files. Gates: `upstream_sync.py --check-only` 27/27, 485 tests on the first sync
+and 635 on the second, app boots on `0.0.0.0:7011`, `/api/providers/*` and `/api/auto/pool` answer 401
+(registered behind auth).
+The mirror fork is now level with `odysseus-dev/dev`; `gh repo sync` still returns HTTP 403 from this
+sandbox, so each sync needs the owner to fast-forward the fork first.
 
 **Key pool (new).** One endpoint, many credentials, automatic rotation:
 
