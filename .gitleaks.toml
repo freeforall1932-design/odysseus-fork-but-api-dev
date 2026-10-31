@@ -1,4 +1,4 @@
-# Gitleaks configuration: the built-in default rules plus three narrow exceptions.
+# Gitleaks configuration: the built-in default rules plus five narrow exceptions.
 #
 # THIRD_PARTY_PROVENANCE.json keys its transitive npm notices by
 # "<package>_<version>" ("key": "inherits_2.0.4"). Four of those identifiers
@@ -54,10 +54,23 @@ regexes = [
 # generic-api-key rule, and `gitleaks git` scans history, so correcting the
 # current tree (done) does not clear the scan on its own. The regex is anchored
 # to the exact literal and cannot mask anything else.
-
 [[allowlists]]
 description = "Historical downstream test fixture placeholder (not a credential)"
+targetRules = ["generic-api-key"]
 regexTarget = "secret"
 regexes = [
   '''^sk-LEAKTEST-123456$''',
+]
+
+# Downstream (this repository only): the replaceable Chatbox AI licence fixture
+# in tests/test_provider_chatbox_routes.py used to be the literal below. The test
+# mocks the HTTP layer, so it was never a usable credential, and the fixture is
+# now letters-only; but the old literal still sits in commits 05299dd1 and
+# 76023907 and `gitleaks git` scans history. Anchored to that exact string only.
+[[allowlists]]
+description = "Historical Chatbox AI test licence fixture (not a credential)"
+targetRules = ["generic-api-key"]
+regexTarget = "secret"
+regexes = [
+  '''^cbx-route-test-key-abcdef123456$''',
 ]

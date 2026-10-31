@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 import routes.provider_routes as pr
 from src import chatbox_ai, provider_presets as pp
 
-KEY = "cbx-route-test-key-abcdef123456"
+KEY = "cbx-route-fixture-license"
 DETAIL = {
     "name": "Chatbox AI Pro",
     "plan": "pro",
