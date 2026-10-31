@@ -49,3 +49,16 @@ def test_missing_license_row_is_safe(monkeypatch):
     monkeypatch.setattr(chatbox_ai, "instance_id_for_key", boom)
     headers = er.build_headers("lic", "https://api.chatboxai.app/gateway/openai/v1")
     assert headers == {"Authorization": "Bearer lic"}
+
+
+def test_keyless_endpoint_still_gets_protocol_headers(monkeypatch):
+    """A row without api_key must not lose anthropic-version (compare/chat paths).
+
+    Chatbox stores its license in its own table, so header building can run with
+    an empty key; callers build unconditionally rather than gating on api_key.
+    """
+    monkeypatch.setattr(chatbox_ai, "instance_id_for_key", lambda key: "")
+    assert er.build_headers("", "https://api.chatboxai.app/gateway/anthropic/v1") == {
+        "anthropic-version": "2023-06-01",
+    }
+    assert er.build_headers("", "http://localhost:11434/v1") == {}

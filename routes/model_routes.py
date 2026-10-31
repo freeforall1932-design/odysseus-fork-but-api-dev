@@ -1402,6 +1402,19 @@ def _picker_requires_pinning(base_url: str, kind: str) -> bool:
     return _classify_endpoint(base_url, kind) == "api"
 
 
+def _first_default_model(model_ids, pinned) -> str:
+    """Default model for a newly created endpoint.
+
+    Live ``/models`` results win. Otherwise use the first pinned id: connect
+    flows that skip the probe (Chatbox AI license gateways, other catalog-only
+    providers) carry their whole catalog as pins, and an empty default would
+    leave the first-run picker pointing at nothing.
+    """
+    from src.endpoint_resolver import _first_chat_model
+
+    return _first_chat_model(model_ids) or (pinned[0] if pinned else "")
+
+
 def _has_explicit_pinned_models(ep) -> bool:
     """Whether pinned_models was deliberately written for this endpoint.
 
@@ -2379,13 +2392,8 @@ def setup_model_routes(model_discovery):
                 current_default_endpoint=current_default_ep,
                 current_default_model=settings.get("default_model") or "",
             ):
-                from src.endpoint_resolver import _first_chat_model
                 settings["default_endpoint_id"] = ep.id
-                # Pinned models are real models too: Chatbox AI (and any other
-                # connect flow that skips an unavailable /models probe) supplies
-                # the catalog as pins, so falling back to "" here would leave the
-                # first-run default pointing at an empty model id.
-                settings["default_model"] = _first_chat_model(model_ids) or (_pinned[0] if _pinned else "")
+                settings["default_model"] = _first_default_model(model_ids, _pinned)
                 _save_settings(settings)
             _invalidate_models_cache()
             _local_probe_cache["data"] = None

@@ -2201,3 +2201,12 @@ def test_manual_refresh_timeout_keeps_cached_models_and_warns(monkeypatch):
     assert db.commits == 0
     assert response.headers["X-Model-Refresh-Status"] == "failed"
     assert "kept cached models" in response.headers["X-Model-Refresh-Warning"]
+
+
+def test_first_default_model_prefers_live_models_then_pins():
+    """Connect flows that skip the /models probe (e.g. Chatbox AI) pin their catalog."""
+    from routes.model_routes import _first_default_model
+
+    assert _first_default_model(["claude-sonnet-4"], ["pinned-a"]) == "claude-sonnet-4"
+    assert _first_default_model([], ["pinned-a", "pinned-b"]) == "pinned-a"
+    assert _first_default_model([], []) == ""
