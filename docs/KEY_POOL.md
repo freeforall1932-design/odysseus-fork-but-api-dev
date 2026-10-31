@@ -119,9 +119,16 @@ particular provider's quota page agrees.
 
 ## Not in this change
 
-* Auto-tuned key weights from measured latency (priority is manual today).
+* Auto-tuned key weights from measured latency (priority is manual today and
+  not yet editable in the UI).
 * Cross-process pools (a second Odysseus worker keeps its own cooldowns).
 * Key health persistence across restarts (deliberate: see the policy above).
+* Rotation in the **sync** `llm_call` (only `llm_call_async` and `stream_llm`
+  are hooked), and rotation when a provider answers `200` with an error body —
+  that case is now *accounted* as a failure but still raises immediately.
+* Pools on Chatbox AI endpoints: a second license has no active row, so it
+  rotates without its `Instance-Id`. Tracked in `WORKLIST.md` (B9) together with
+  the rest of the open rotation items.
 * Multi-agent "team" orchestration (architect / implementer / reviewer roles).
   Planned next, modelled on ChatDev: roles run in sequence over one shared
   brief, and their notes go into Odysseus's existing memory/RAG store rather

@@ -87,6 +87,26 @@ sitting each: S ≈ under an hour, M ≈ half a day, L ≈ a day or more.
 **B6 — Which key served the turn** · S (optional)
 - [ ] Include the masked key id in the existing usage event so the pool card and the message meta agree.
 
+**B7 — Rotate in the sync `llm_call`** · S
+- [ ] The sync path (`llm_call`, `llm_call_with_fallback`) has no pool hook: a scheduled job that uses it still dies on a 429. Either route it through `llm_call_async` or wrap it in the same retry loop.
+- [ ] Tests mirroring the async ones.
+
+**B8 — `200 + {"error": ...}` responses** · S (accounting fixed, rotation pending)
+- [x] Accounting: the key is no longer marked successful when the body carries an error (`_note_key_failure`).
+- [ ] Rotation: treat that case as key-scoped too, instead of raising straight away.
+
+**B9 — Pool for Chatbox AI endpoints** · S
+- [ ] `ChatboxAILicense` keeps **one active row per owner**, so a pooled second license loses its `Instance-Id` (`instance_id_for_key` filters `is_active`). Either allow several active licenses (one per endpoint key) or hide the pool card for Chatbox endpoints until that lands. Today the card lets you add a key that will rotate *without* its seat header.
+
+**B10 — Pool UI never exercised in a browser** · S
+- [ ] No Playwright in the sandbox: the card's add/remove/reset flow is only unit-tested (`poolKeyLabel`). Run it once against a real server with two keys of the same provider, then note the result here.
+
+**B11 — Priority is stored but not editable** · S
+- [ ] `describe_pool()` exposes `priority` and `POST /api/providers/keys` accepts it, but the card has no control. Add a number input, or drop the field from the response so the API does not promise what the UI cannot set.
+
+**B12 — Rotation lookup cost** · S (optional)
+- [ ] `endpoint_for_key()` decrypts every `ModelEndpoint` row until it finds a match. Fine on failure paths, wasteful with many endpoints: add a fingerprint index or cache the mapping.
+
 ---
 
 ## Track C — Upstream sync
@@ -100,11 +120,37 @@ sitting each: S ≈ under an hour, M ≈ half a day, L ≈ a day or more.
 
 ## Track D — Chatbox AI follow-ups
 
+**D0 — Delivery** · done (`7602390`, `05299dd`, `51cad1f`)
+- [x] License activation + encrypted storage, model catalogue, two gateway endpoints, plan/quota card, unlink with seat release, unsupported-model badges, `docs/CHATBOX_AI.md`.
+- [x] 80 tests across client, routing, routes, encrypted storage and the JS helpers.
+- [ ] No live license has ever been run through it — see D1.
+
 - [ ] **D1** Live-license smoke test on a machine with egress to `api.chatboxai.app` (the sandbox has none; every test is mocked).
 - [ ] **D2** Decide whether to add Gemini-native / OpenAI-Responses adapters or hide those models entirely.
 - [ ] **D3** If a Claude call fails on a gateway-specific beta header, capture the response and add it in `build_headers` — do not guess.
 
 ---
+
+## Session audit (checked 2026-10-31, after the second upstream merge)
+
+What was actually re-verified rather than assumed:
+
+| Claim | How it was checked | Verdict |
+|---|---|---|
+| Anthropic (Claude) deltas can be continued mid-answer | read the `content_block_delta` branch: it emits `data: {"delta": text}`, the same shape `_stream_delta_text` parses | OK — continuation works for Claude models, not only OpenAI ones |
+| Agent mode inherits key rotation | `agent_loop` uses `stream_llm_with_fallback` → `_stream_candidate_with_context_recovery` → `stream_llm` | OK — rotation applies to agent turns too |
+| Non-streaming callers rotate | **was untested**; added two tests with a fake transport (429 then 200 → second key used; no second key → 429 still raised) | Fixed (`test_key_pool.py`) |
+| A key that returns `200 + {"error": ...}` is not recorded as healthy | **was wrong**: `_note_key_success` ran before the error check. Moved after it, added `_note_key_failure` | Fixed; rotation for that case still open (B8) |
+| No raw key is logged by the pool | grepped every `logger.*` in `key_pool.py` — fingerprints (`[:8]`) and masks only | OK |
+| Every new route is admin-gated | enumerated all `@router.*` in `provider_routes.py` and matched `require_admin(request)` | OK — 6/6 |
+| Pooled keys are encrypted at rest | existing test reads raw SQL and asserts an `enc:` prefix | OK |
+| A locked-up pool cannot break routing | `_pooled_key()` swallows exceptions and falls back to the endpoint's own key; covered by `test_resolve_endpoint_runtime_survives_a_broken_pool` | OK |
+| Full suite has no new failures | full run vs. the base-commit baseline (same 73 environment-only failures) | see the run recorded in `SESSION_HANDOFF.md` |
+| The pool card works in a browser | **not possible here** (no Playwright/Chromium) | Open — B10 |
+| DeepSeek/other `data: {"error": ...}` 200-shaped streams rotate | only the HTTP-status path is handled | Open — B8 |
+
+Not done, and not hidden: Track A (agent team) has not been started; B3/B4/B5, B7–B12,
+C3–C4 and D1–D3 are open. Nothing from this session was left uncommitted.
 
 ## How to verify each task
 

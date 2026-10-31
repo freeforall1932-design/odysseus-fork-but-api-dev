@@ -336,3 +336,107 @@ def test_stream_does_not_resume_after_tool_calls(monkeypatch):
     chunks = asyncio.run(run())
     assert len(calls) == 1
     assert any(c.startswith("event: error") for c in chunks)
+
+
+# --------------------------------------------------------------------------- non-stream hook
+
+
+class _FakeResponse:
+    def __init__(self, status_code, payload=None, text="", headers=None):
+        self.status_code = status_code
+        self._payload = payload or {}
+        self.text = text or json.dumps(self._payload)
+        self.headers = headers or {}
+        self.is_success = 200 <= status_code < 300
+        self.content = self.text.encode()
+
+    def json(self):
+        return self._payload
+
+
+def test_non_stream_call_retries_on_the_next_key(monkeypatch):
+    """Background callers (research, tasks, skills) must rotate too."""
+    from src import llm_core
+
+    key_pool.add_key(ENDPOINT_ID, SECOND)
+    seen_auth = []
+    responses = [
+        _FakeResponse(429, text='{"error": "rate limited"}', headers={"retry-after": "9"}),
+        _FakeResponse(200, {"model": "model-x", "choices": [{"message": {"content": "done"}}]}),
+    ]
+
+    async def fake_post(client, url, headers, **kwargs):
+        seen_auth.append((headers or {}).get("Authorization"))
+        return responses.pop(0)
+
+    monkeypatch.setattr(llm_core, "httpx_post_kimi_aware_async", fake_post)
+    monkeypatch.setattr(llm_core, "_get_http_client", lambda: object())
+
+    async def run():
+        return await llm_core.llm_call_async(
+            "https://api.example.test/v1", "model-x",
+            [{"role": "user", "content": "hi"}],
+            headers={"Authorization": f"Bearer {PRIMARY}"},
+        )
+
+    assert asyncio.run(run()) == "done"
+    assert seen_auth == [f"Bearer {PRIMARY}", f"Bearer {SECOND}"]
+    # The failed key is resting, the working key is recorded as a success.
+    health = key_pool.health_snapshot(ENDPOINT_ID)
+    assert health[key_pool.fingerprint(PRIMARY)].cooling()
+    assert health[key_pool.fingerprint(SECOND)].successes == 1
+
+
+def test_non_stream_call_keeps_the_error_when_no_key_is_left(monkeypatch):
+    from src import llm_core
+
+    async def fake_post(client, url, headers, **kwargs):
+        return _FakeResponse(429, text='{"error": "rate limited"}')
+
+    monkeypatch.setattr(llm_core, "httpx_post_kimi_aware_async", fake_post)
+    monkeypatch.setattr(llm_core, "_get_http_client", lambda: object())
+
+    async def run():
+        try:
+            # A distinct model keeps llm_call_async's response cache out of the way.
+            await llm_core.llm_call_async(
+                "https://api.example.test/v1", "model-no-pool",
+                [{"role": "user", "content": "different prompt"}],
+                headers={"Authorization": f"Bearer {PRIMARY}"},
+            )
+        except Exception as exc:  # noqa: BLE001 - the status is the assertion
+            return exc
+        return None
+
+    error = asyncio.run(run())
+    assert error is not None and getattr(error, "status_code", None) == 429
+
+
+def test_200_with_an_error_body_counts_as_a_key_failure(monkeypatch):
+    """Some providers answer 200 + {"error": ...}; that key is not healthy."""
+    from src import llm_core
+
+    async def fake_post(client, url, headers, **kwargs):
+        return _FakeResponse(200, {"error": {"message": "quota exhausted", "type": "insufficient_quota"}})
+
+    monkeypatch.setattr(llm_core, "httpx_post_kimi_aware_async", fake_post)
+    monkeypatch.setattr(llm_core, "_get_http_client", lambda: object())
+
+    async def run():
+        try:
+            await llm_core.llm_call_async(
+                "https://api.example.test/v1", "model-200-error",
+                [{"role": "user", "content": "200 with error"}],
+                headers={"Authorization": f"Bearer {PRIMARY}"},
+                max_retries=1,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return exc
+        return None
+
+    assert asyncio.run(run()) is not None
+    health = key_pool.health_snapshot(ENDPOINT_ID)
+    entry = health.get(key_pool.fingerprint(PRIMARY))
+    assert entry is not None
+    assert entry.successes == 0        # never counted as a success
+    assert entry.failures >= 1

@@ -2686,6 +2686,19 @@ def _rotate_nonstream_key(headers, url, response, tried):
     return rotated
 
 
+def _note_key_failure(headers, url, status, message=""):
+    """Record a provider error that arrived inside a 200 response."""
+    try:
+        from src import key_pool
+
+        current = key_pool.current_key(headers)
+        endpoint_id = key_pool.endpoint_for_key(current) if current else None
+        if endpoint_id:
+            key_pool.record_failure(endpoint_id, current, status=status, body=message)
+    except Exception:  # pragma: no cover
+        logger.debug("key failure accounting failed", exc_info=True)
+
+
 def _note_key_success(headers, url):
     try:
         from src import key_pool
@@ -2907,7 +2920,6 @@ async def llm_call_async(
                 raise HTTPException(r.status_code, friendly)
             logger.info(f"LLM async call to {target_url} succeeded in {duration:.2f}s (attempt {attempt})")
             _clear_host_dead(target_url)
-            _note_key_success(h, target_url)
             data = r.json()
             if isinstance(data, dict) and data.get("error"):
                 provider_error = data["error"]
@@ -2916,7 +2928,11 @@ async def llm_call_async(
                     detail = provider_error.get("message") or provider_error.get("type") or str(provider_error)
                 else:
                     detail = str(provider_error)
+                # Some providers answer 200 with an error body. That is still a
+                # failed key, not a success: account for it before raising.
+                _note_key_failure(h, target_url, status, detail)
                 raise HTTPException(status, detail or "Upstream request failed")
+            _note_key_success(h, target_url)
             try:
                 reported_model = data.get("model") if isinstance(data, dict) else None
                 actual_model = (
