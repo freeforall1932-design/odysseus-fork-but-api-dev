@@ -32,7 +32,7 @@ chat models and registers one endpoint per gateway protocol: **Chatbox AI** (Ope
 **Chatbox AI · Claude** (Anthropic Messages). Gemini-native and OpenAI-Responses catalog entries are shown but disabled
 because Odysseus does not implement those protocols yet. The license key is encrypted at rest, never returned to the
 browser, and `Instance-Id` rides along on gateway calls. **Unlink license** releases the seat and disables the matching
-endpoints. Details and the wire contract: [docs/CHATBOX_AI.md](../docs/CHATBOX_AI.md).
+endpoints. Details and the wire contract: `docs/CHATBOX_AI.md` in the repository (the Pages tree only links pages it ships).
 
 ## Auto
 `PUT /api/auto/pool` stores the pool (max 60) and settings in the existing per-user prefs store.
