@@ -248,16 +248,79 @@ def test_stream_retries_on_a_fresh_key_before_any_output(monkeypatch):
     assert not any(c.startswith("event: error") for c in chunks)
 
 
-def test_stream_does_not_hide_an_error_after_output(monkeypatch):
-    """A mid-stream failure is reported, never silently re-tried."""
+def test_stream_continues_mid_answer_on_the_next_key(monkeypatch):
+    """A key that dies mid-sentence hands the partial text to the next key."""
     from src import llm_core
 
     key_pool.add_key(ENDPOINT_ID, SECOND)
     calls = []
 
     async def fake_inner(url, model, messages, **kwargs):
+        calls.append(messages)
+        if len(calls) == 1:
+            yield 'data: {"delta": "The answer is par"}\n\n'
+            yield 'event: error\ndata: {"error": "quota", "status": 429}\n\n'
+            return
+        yield 'data: {"delta": "tially done."}\n\n'
+        yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr(llm_core, "_stream_llm_inner", fake_inner)
+    monkeypatch.setattr(llm_core, "_stream_target_url", lambda url: url)
+
+    async def run():
+        return [c async for c in llm_core.stream_llm(
+            "https://api.example.test/v1", "model-x",
+            [{"role": "user", "content": "hi"}],
+            headers={"Authorization": f"Bearer {PRIMARY}"},
+        )]
+
+    chunks = asyncio.run(run())
+    assert len(calls) == 2
+    # The retry carries the partial answer as an assistant prefix.
+    assert calls[1][-1]["role"] == "assistant"
+    assert calls[1][-1]["content"] == "The answer is par"
+    # Nothing is repeated to the user, and nothing errors out.
+    assert not any(c.startswith("event: error") for c in chunks)
+    text = "".join(llm_core._stream_delta_text(c) for c in chunks)
+    assert text == "The answer is partially done."
+
+
+def test_stream_surfaces_the_error_when_no_key_is_left(monkeypatch):
+    """A single-key endpoint keeps the old behaviour: the error is visible."""
+    from src import llm_core
+
+    calls = []
+
+    async def fake_inner(url, model, messages, **kwargs):
         calls.append(1)
         yield 'data: {"delta": "partial"}\n\n'
+        yield 'event: error\ndata: {"error": "rate limited", "status": 429}\n\n'
+
+    monkeypatch.setattr(llm_core, "_stream_llm_inner", fake_inner)
+    monkeypatch.setattr(llm_core, "_stream_target_url", lambda url: url)
+
+    async def run():
+        return [c async for c in llm_core.stream_llm(
+            "https://api.example.test/v1", "model-x",
+            [{"role": "user", "content": "hi"}],
+            headers={"Authorization": f"Bearer {PRIMARY}"},
+        )]
+
+    chunks = asyncio.run(run())
+    assert len(calls) == 1
+    assert any(c.startswith("event: error") for c in chunks)
+
+
+def test_stream_does_not_resume_after_tool_calls(monkeypatch):
+    """Tool-call streams restart cleanly or fail; they are never spliced."""
+    from src import llm_core
+
+    key_pool.add_key(ENDPOINT_ID, SECOND)
+    calls = []
+
+    async def fake_inner(url, model, messages, **kwargs):
+        calls.append(messages)
+        yield 'data: {"type": "tool_calls", "calls": [{"name": "read"}]}\n\n'
         yield 'event: error\ndata: {"error": "rate limited", "status": 429}\n\n'
 
     monkeypatch.setattr(llm_core, "_stream_llm_inner", fake_inner)

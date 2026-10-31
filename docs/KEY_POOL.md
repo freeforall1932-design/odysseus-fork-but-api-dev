@@ -12,16 +12,24 @@ credentials, one continuous conversation.
 
 | Situation | Before | With a pool |
 |---|---|---|
-| Key hits `429` on a chat turn | error event / fallback to another *model* | same model, next key, stream starts over before the user sees a token |
+| Key hits `429` on a chat turn | error event / fallback to another *model* | same model, next key; before the first token the request simply restarts |
 | Key's quota is spent (`402`, or `403` + "insufficient_quota") | error | next key picks up; the exhausted key rests 30 minutes |
 | Key is invalid (`401`) | error | that key rests an hour, the request moves on |
 | Provider outage (`5xx`, timeout) | host cooldown | unchanged — switching keys would only burn the next quota |
 | Extra key added later | edit the endpoint, break the running chat | added live, no restart, no endpoint edit |
 
-Failover is **transparent** while nothing has been shown yet. Once text or tool
-calls are on screen a silent retry would duplicate or garble the answer, so the
-error is surfaced and the normal foreground fallback policy decides what
-happens next (that part is upstream behaviour and is unchanged).
+Failover is **seamless in two cases**:
+
+* nothing has been shown yet — the request is re-run on the next key;
+* the answer stopped mid-sentence — the partial text is sent back as an
+  assistant prefix, so the next key *continues where the last one stopped*
+  instead of regenerating the answer. The user sees one continuous reply.
+
+Exactly the text already on screen is pre-filled (no trimming), because a
+trimmed prefix would make the model repeat the half-written word. A partial
+**tool-call** stream is never spliced — restarting it would double-execute
+tools — so that case surfaces the error and lets the foreground fallback policy
+decide. Continuations are capped at three per request.
 
 ## Shared memory
 
@@ -79,7 +87,7 @@ POST   /api/providers/keys/reset?endpoint_id=<id>   # forget cooldowns
 | Seam | Effect |
 |---|---|
 | `src/endpoint_resolver.resolve_endpoint_runtime()` | every caller (chat, agent tools, skills, research, webhooks, background tasks) gets the next healthy key |
-| `src/llm_core.stream_llm()` | pre-first-token `401/402/403/429` is retried on a fresh key; after output the error is surfaced |
+| `src/llm_core.stream_llm()` | pre-first-token `401/402/403/429` restarts on a fresh key; a mid-answer failure resumes from the partial text |
 | `src/llm_core.llm_call_async()` | retries immediately with the next key instead of sleeping on the same one |
 | `routes/provider_routes.py` | pool CRUD (`/api/providers/keys*`) |
 | `static/js/providerHub.js` | pool card in the provider dialog |
@@ -91,7 +99,7 @@ POST   /api/providers/keys/reset?endpoint_id=<id>   # forget cooldowns
 | `src/key_pool.py` | Selection, cooldowns, rotation, masking, pool summary |
 | `core/database.py` | `ProviderKey` table |
 | `src/endpoint_resolver.py` | Pool-aware `resolve_endpoint_runtime` |
-| `src/llm_core.py` | Stream + non-stream rotation hooks |
+| `src/llm_core.py` | Stream continuation + non-stream rotation hooks |
 | `routes/provider_routes.py` | Pool CRUD routes |
 | `static/js/providerHub.js` | Pool card, `poolKeyLabel` helper |
 | `tests/test_key_pool.py` | Policy, selection, headers, streaming retry |
@@ -114,6 +122,7 @@ particular provider's quota page agrees.
 * Auto-tuned key weights from measured latency (priority is manual today).
 * Cross-process pools (a second Odysseus worker keeps its own cooldowns).
 * Key health persistence across restarts (deliberate: see the policy above).
-* Multi-agent "team" orchestration (architect / implementer / reviewer roles) —
-  Council covers multi-model answers today; an agent team would be its own
-  feature.
+* Multi-agent "team" orchestration (architect / implementer / reviewer roles).
+  Planned next, modelled on ChatDev: roles run in sequence over one shared
+  brief, and their notes go into Odysseus's existing memory/RAG store rather
+  than a parallel one.

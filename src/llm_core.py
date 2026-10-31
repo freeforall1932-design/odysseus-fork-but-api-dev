@@ -3061,30 +3061,59 @@ def _stream_error_payload(chunk: str):
     return None, ""
 
 
+def _stream_delta_text(chunk: str) -> str:
+    """Visible text carried by one SSE chunk (empty for any other event)."""
+    if not isinstance(chunk, str) or not chunk.startswith("data: "):
+        return ""
+    body = chunk[6:].strip()
+    if not body or body.startswith("[DONE]"):
+        return ""
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    delta = payload.get("delta")
+    return delta if isinstance(delta, str) else ""
+
+
 async def stream_llm(url: str, model: str, messages: List[Dict], temperature: float = LLMConfig.DEFAULT_TEMPERATURE,
                      max_tokens: int = LLMConfig.DEFAULT_MAX_TOKENS, headers: Optional[Dict] = None,
                      timeout: int = LLMConfig.STREAM_TIMEOUT, prompt_type: Optional[str] = None,
                      tools: Optional[List[Dict]] = None, session_id: Optional[str] = None,
                      tool_choice_none: bool = False, workload: str = "foreground",
                      thinking_mode: Optional[str] = None, reasoning_effort: Optional[str] = None):
-    """Stream one completion, rotating the API key if the provider rejects it.
+    """Stream one completion, rotating the API key when the provider rejects it.
 
-    The key pool swaps the credential and re-runs the request only while nothing
-    has been shown to the user yet (no text, no tool calls). Once tokens are on
-    screen a silent retry would duplicate or garble the answer, so the error goes
-    out as usual and the existing fallback policy decides what happens next.
+    Two cases, both invisible when they work:
+
+    * **Before any output** — the request is simply re-run on the next key.
+    * **Mid-answer** — the partial text is handed back as an assistant prefix so
+      the next key *continues the same sentence* instead of restarting. Some
+      providers reject a prefilled assistant turn; that retry then fails with a
+      4xx before producing anything, and the original error is emitted exactly
+      as it would have been without rotation.
+
+    Continuations are capped per request so a provider that always fails fast
+    cannot loop.
     """
     target_url = _stream_target_url(url)
     active_headers = dict(headers) if headers else headers
     tried_keys: List[str] = []
+    call_messages = messages
+    partial_text = ""
+    tool_emitted = False
+    continuations = 0
+    max_continuations = 3
+
     while True:
-        emitted = False
         rotated = False
         async with _local_model_slot(target_url, model, workload):
             async for chunk in _stream_llm_inner(
                 url,
                 model,
-                messages,
+                call_messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 headers=active_headers,
@@ -3096,20 +3125,35 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
                 thinking_mode=thinking_mode,
                 reasoning_effort=reasoning_effort,
             ):
-                if not emitted:
-                    status, message = _stream_error_payload(chunk)
-                    if status is not None:
+                status, message = _stream_error_payload(chunk)
+                if status is not None:
+                    # Nothing shown yet, or the answer stopped mid-sentence: both
+                    # are recoverable on another key. A partial tool-call stream
+                    # is not: restarting it would double-execute tools.
+                    can_resume = (
+                        bool(partial_text)
+                        and not tool_emitted
+                        and continuations < max_continuations
+                    )
+                    can_restart = not partial_text and not tool_emitted
+                    if can_resume or can_restart:
                         rotated_headers = _rotate_stream_key(
                             active_headers, url, status, message, tried_keys,
                         )
                         if rotated_headers is not None:
                             active_headers = rotated_headers
                             rotated = True
+                            if can_resume:
+                                continuations += 1
+                                call_messages = _continuation_messages(messages, partial_text)
                             break
-                if not emitted and chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
+                if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
                     body = chunk[6:].strip()
-                    if '"delta"' in body or '"tool_calls"' in body or '"type": "tool' in body:
-                        emitted = True
+                    if '"tool_calls"' in body or '"type": "tool' in body:
+                        tool_emitted = True
+                delta = _stream_delta_text(chunk)
+                if delta:
+                    partial_text += delta
                 yield chunk
         if not rotated:
             return
@@ -3138,6 +3182,14 @@ def _rotate_stream_key(active_headers, url, status, message, tried_keys):
     logger.info("key pool: retried stream on a fresh key (status=%s)", status)
     return rotated
 
+
+def _continuation_messages(messages: List[Dict], partial_text: str) -> List[Dict]:
+    """Same conversation with the partial answer pre-filled as the assistant turn.
+
+    Exactly the text the user has already seen is sent back — trimming a
+    half-written word would make the resumed answer repeat it.
+    """
+    return list(messages) + [{"role": "assistant", "content": partial_text}]
 
 
 async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperature: float = LLMConfig.DEFAULT_TEMPERATURE,
