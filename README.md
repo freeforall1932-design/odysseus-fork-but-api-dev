@@ -10,6 +10,8 @@
   <a href="#quick-start">Quick Start</a> ·
   <a href="website/setup.md">Setup Guide</a> ·
   <a href="website/providers-auto-council.md">Providers / Auto / Council</a> ·
+  <a href="docs/CHATBOX_AI.md">Chatbox AI</a> ·
+  <a href="docs/KEY_POOL.md">Key rotation</a> ·
   <a href="CONTRIBUTING.md">Contributing</a> ·
   <a href="ROADMAP.md">Roadmap</a>
 </p>
