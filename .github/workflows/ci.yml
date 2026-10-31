@@ -255,7 +255,19 @@ jobs:
         if: steps.docs-check.outputs.docs_only != 'true'
         env:
           PYTEST_SHARD: ${{ matrix.shard }}
-        run: python -m pytest -q -rs --durations=25 --shard "$PYTEST_SHARD"
+        run: |
+          status=0
+          python -m pytest -q -rs --durations=25 --shard "$PYTEST_SHARD" > pytest-out.log 2>&1 || status=$?
+          tail -n 80 pytest-out.log
+          if [ "$status" -ne 0 ]; then
+            if grep -qE '^(FAILED|ERROR) ' pytest-out.log; then
+              grep -E '^(FAILED|ERROR) ' pytest-out.log | head -20 | \
+                while IFS= read -r line; do echo "::error title=pytest failure::${line}"; done
+            fi
+            tail -n 50 pytest-out.log | sed -e ':a' -e 'N' -e '$!ba' -e 's/%/%25/g' -e 's/\n/%0A/g' > ann.txt
+            echo "::error title=pytest tail (status $status)::$(cat ann.txt)"
+          fi
+          exit "$status"
 
       - name: Playwright mobile layout checks (shard 1/4 only)
         if: steps.docs-check.outputs.docs_only != 'true' && matrix.shard == '1/4'
